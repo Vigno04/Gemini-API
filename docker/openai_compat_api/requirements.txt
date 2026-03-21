@@ -4,3 +4,4 @@ curl-cffi~=0.14.0
 loguru~=0.7.3
 orjson~=3.11.7
 pydantic~=2.12.5
+tiktoken~=0.8.0
