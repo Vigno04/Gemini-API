@@ -5,3 +5,4 @@ loguru~=0.7.3
 orjson~=3.11.7
 pydantic~=2.12.5
 tiktoken~=0.8.0
+python-multipart~=0.0.9
