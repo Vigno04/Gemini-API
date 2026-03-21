@@ -17,7 +17,7 @@ from models import (
     EmbeddingRequest,
     ImageGenerationRequest,
 )
-from utils import _require_auth, _messages_to_prompt, _estimate_tokens, _estimate_cost, _unix_ts
+from utils import _require_auth, _messages_to_prompt, _estimate_tokens, _estimate_cost, _unix_ts, _debug_log
 from usage_tracker import UsageTracker
 
 
@@ -30,21 +30,30 @@ class AppState:
 state = AppState()
 
 
+@app.get("/health")
+async def health_check() -> dict[str, Any]:
+    """Health check endpoint that shows the status of the Gemini client."""
+    client_status = "initialized" if state.client is not None else "not_initialized"
+    response = {
+        "status": "healthy" if state.client is not None else "unhealthy",
+        "gemini_client": client_status,
+        "timestamp": _unix_ts()
+    }
+    _debug_log(f"Health check: {response}")
+    return response
+
+
 @app.get("/v1/models")
 @app.get("/models")
 @app.get("/v/models")
 async def list_models(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     _require_auth(authorization)
 
-    # Expanded list of available Gemini models
+    # Available Gemini models (as documented in README)
     data = [
         {"id": "gemini-3-flash", "object": "model", "created": 0, "owned_by": "gemini-webapi"},
         {"id": "gemini-3-pro", "object": "model", "created": 0, "owned_by": "gemini-webapi"},
         {"id": "gemini-3-flash-thinking", "object": "model", "created": 0, "owned_by": "gemini-webapi"},
-        {"id": "gemini-2-flash", "object": "model", "created": 0, "owned_by": "gemini-webapi"},
-        {"id": "gemini-2-pro", "object": "model", "created": 0, "owned_by": "gemini-webapi"},
-        {"id": "gemini-1-5-flash", "object": "model", "created": 0, "owned_by": "gemini-webapi"},
-        {"id": "gemini-1-5-pro", "object": "model", "created": 0, "owned_by": "gemini-webapi"},
     ]
     return {"object": "list", "data": data}
 
@@ -63,6 +72,8 @@ async def chat_completions(
     model = payload.model or os.getenv("OPENAI_COMPAT_DEFAULT_MODEL", "gemini-3-flash")
     prompt = _messages_to_prompt(payload.messages)
     use_temporary_chats = os.getenv("OPENAI_COMPAT_USE_TEMPORARY_CHATS", "true").lower() == "true"
+
+    _debug_log(f"Chat completion request: model={model}, messages={len(payload.messages)}, stream={payload.stream}")
 
     if payload.stream:
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
@@ -177,6 +188,8 @@ async def chat_completions(
     # Track usage
     cost = _estimate_cost(model, prompt_tokens, completion_tokens)
     state.usage_tracker.track_request(model, prompt_tokens, completion_tokens, cost)
+
+    _debug_log(f"Chat completion response: id={completion_id}, tokens={total_tokens}, images={len(output.images) if hasattr(output, 'images') else 0}")
 
     return {
         "id": completion_id,
@@ -348,6 +361,8 @@ async def create_image(
     # Use Gemini to generate image with a prompt that encourages image generation
     image_prompt = f"Generate an image based on this description: {payload.prompt}"
 
+    _debug_log(f"Image generation request: prompt='{payload.prompt[:50]}...', model={payload.model}")
+
     try:
         output = await client.generate_content(
             prompt=image_prompt,
@@ -378,6 +393,7 @@ async def create_image(
         }
 
     except Exception as e:
+        _debug_log(f"Image generation failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Image generation failed: {str(e)}")
 
 
@@ -398,6 +414,8 @@ async def edit_image(
     if state.client is None:
         raise HTTPException(status_code=503, detail="Gemini client is not initialized")
     client = state.client
+
+    _debug_log(f"Image edit request: prompt='{prompt[:50] if prompt else None}...', model={model}, has_mask={mask is not None}")
 
     try:
         # Handle image input (file upload, base64, or URL)
@@ -474,6 +492,7 @@ async def edit_image(
         }
 
     except Exception as e:
+        _debug_log(f"Image edit failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Image editing failed: {str(e)}")
 
 
@@ -492,6 +511,8 @@ async def create_image_variations(
     if state.client is None:
         raise HTTPException(status_code=503, detail="Gemini client is not initialized")
     client = state.client
+
+    _debug_log(f"Image variations request: model={model}")
 
     try:
         # Handle image input (file upload, base64, or URL)
@@ -546,6 +567,7 @@ async def create_image_variations(
         }
 
     except Exception as e:
+        _debug_log(f"Image variations failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Image variation failed: {str(e)}")
 
 

@@ -8,8 +8,8 @@ WORKDIR /app
 COPY docker/openai_compat_api/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-# Run against local source tree to keep wrapper decoupled from upstream packaging quirks.
-COPY . /workspace
+# Copy the gemini_webapi source code
+COPY src /workspace/src
 ENV PYTHONPATH=/workspace/src
 
 COPY docker/openai_compat_api/app /app

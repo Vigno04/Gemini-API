@@ -17,18 +17,17 @@ This folder contains an isolated compatibility layer that exposes OpenAI-style e
 Notes:
 - `stream=true` is supported for `/v1/chat/completions` and `/v1/completions` using SSE (`data:` chunks + `[DONE]`).
 - Token usage fields are returned as `0` because Gemini web responses do not provide OpenAI token accounting.
+- Set `OPENAI_COMPAT_DEBUG=true` to enable detailed request/response logging for debugging.
 
-## Prebuilt image
+## Environment Variables
 
-Default image reference in compose:
-
-- `ghcr.io/hanaokayuzu/gemini-api-openai-compat:develop`
-
-Override it on your own server with `OPENAI_COMPAT_IMAGE`, for example:
-
-```dotenv
-OPENAI_COMPAT_IMAGE=ghcr.io/<your-org>/<your-image>:develop
-```
+- `GEMINI_SECURE_1PSID` - Required: Your Gemini session token
+- `GEMINI_SECURE_1PSIDTS` - Optional: Additional session token for some accounts  
+- `GEMINI_PROXY` - Optional: Proxy URL for requests
+- `OPENAI_COMPAT_API_KEY` - Optional: API key for authentication
+- `OPENAI_COMPAT_DEFAULT_MODEL` - Optional: Default model (default: gemini-3-flash)
+- `OPENAI_COMPAT_DEBUG` - Optional: Enable detailed logging (default: false)
+- `OPENAI_COMPAT_USE_TEMPORARY_CHATS` - Optional: Use temporary chats (default: true)
 
 ## Quick start
 
