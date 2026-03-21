@@ -8,6 +8,11 @@ This folder contains an isolated compatibility layer that exposes OpenAI-style e
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 - `POST /v1/completions`
+- `POST /v1/images/generations`
+- `POST /v1/images/edits`
+- `POST /v1/images/variations`
+- `POST /v1/moderations`
+- `POST /v1/embeddings`
 
 Notes:
 - `stream=true` is supported for `/v1/chat/completions` and `/v1/completions` using SSE (`data:` chunks + `[DONE]`).

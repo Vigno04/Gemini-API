@@ -1,5 +1,6 @@
 import os
 import uuid
+import base64
 from typing import Any
 from fastapi import Header, HTTPException, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
@@ -376,6 +377,174 @@ async def create_image(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Image generation failed: {str(e)}")
+
+
+@app.post("/v1/images/edits")
+async def edit_image(
+    image: str | UploadFile = Form(...),
+    prompt: str | None = Form(None),
+    mask: str | UploadFile | None = Form(None),
+    model: str = Form("gemini-3-flash"),
+    n: int = Form(1),
+    size: str = Form("1024x1024"),
+    response_format: str = Form("url"),
+    user: str | None = Form(None),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _require_auth(authorization)
+
+    if state.client is None:
+        raise HTTPException(status_code=503, detail="Gemini client is not initialized")
+    client = state.client
+
+    try:
+        # Handle image input (file upload, base64, or URL)
+        if isinstance(image, UploadFile):
+            image_data = await image.read()
+        elif isinstance(image, str):
+            if image.startswith("data:"):
+                # Base64 data URL
+                header, base64_data = image.split(",", 1)
+                image_data = base64.b64decode(base64_data)
+            elif image.startswith("http"):
+                # URL - would need to download, but for now raise error
+                raise HTTPException(status_code=400, detail="URL images not yet supported for edits")
+            else:
+                # Assume base64 string
+                image_data = base64.b64decode(image)
+        else:
+            raise HTTPException(status_code=400, detail="Invalid image format")
+
+        # Handle mask input if provided
+        mask_data = None
+        if mask is not None:
+            if isinstance(mask, UploadFile):
+                mask_data = await mask.read()
+            elif isinstance(mask, str):
+                if mask.startswith("data:"):
+                    header, base64_data = mask.split(",", 1)
+                    mask_data = base64.b64decode(base64_data)
+                elif mask.startswith("http"):
+                    raise HTTPException(status_code=400, detail="URL masks not yet supported")
+                else:
+                    mask_data = base64.b64decode(mask)
+
+        # Prepare the prompt for editing
+        edit_prompt = f"Edit this image: {prompt}" if prompt else "Modify this image"
+
+        # Note: Gemini doesn't have built-in mask support like DALL-E
+        # For now, we'll ignore the mask and just use the prompt
+        if mask_data:
+            # Could potentially use mask in future implementation
+            pass
+
+        # Use Gemini to edit the image
+        output = await client.generate_content(
+            prompt=edit_prompt,
+            model=model,
+            files=[image_data],  # Pass the existing image as file data
+            temporary=True
+        )
+
+        if not output.images:
+            raise HTTPException(
+                status_code=500,
+                detail="No edited image was generated. Try rephrasing your prompt."
+            )
+
+        # Convert to OpenAI-compatible format
+        image_data = []
+        for img in output.images:
+            if response_format == "b64_json":
+                image_data.append({
+                    "b64_json": img.data if hasattr(img, 'data') else "",
+                    "revised_prompt": prompt or ""
+                })
+            else:  # "url" format
+                image_data.append({
+                    "url": img.data_url if hasattr(img, 'data_url') else f"data:{img.mime_type};base64,{img.data}",
+                    "revised_prompt": prompt or ""
+                })
+
+        return {
+            "created": _unix_ts(),
+            "data": image_data
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Image editing failed: {str(e)}")
+
+
+@app.post("/v1/images/variations")
+async def create_image_variations(
+    image: str | UploadFile = Form(...),
+    model: str = Form("gemini-3-flash"),
+    n: int = Form(1),
+    response_format: str = Form("url"),
+    size: str = Form("1024x1024"),
+    user: str | None = Form(None),
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    _require_auth(authorization)
+
+    if state.client is None:
+        raise HTTPException(status_code=503, detail="Gemini client is not initialized")
+    client = state.client
+
+    try:
+        # Handle image input (file upload, base64, or URL)
+        if isinstance(image, UploadFile):
+            image_data = await image.read()
+        elif isinstance(image, str):
+            if image.startswith("data:"):
+                # Base64 data URL
+                header, base64_data = image.split(",", 1)
+                image_data = base64.b64decode(base64_data)
+            elif image.startswith("http"):
+                # URL - would need to download, but for now raise error
+                raise HTTPException(status_code=400, detail="URL images not yet supported for variations")
+            else:
+                # Assume base64 string
+                image_data = base64.b64decode(image)
+        else:
+            raise HTTPException(status_code=400, detail="Invalid image format")
+
+        # Create variations prompt
+        variation_prompt = "Create variations of this image with different styles, colors, or compositions"
+
+        # Generate variations using Gemini
+        output = await client.generate_content(
+            prompt=variation_prompt,
+            model=model,
+            files=[image_data],  # Pass the existing image as file data
+            temporary=True
+        )
+
+        if not output.images:
+            raise HTTPException(
+                status_code=500,
+                detail="No image variations were generated."
+            )
+
+        # Convert to OpenAI-compatible format
+        image_data = []
+        for img in output.images:
+            if response_format == "b64_json":
+                image_data.append({
+                    "b64_json": img.data if hasattr(img, 'data') else "",
+                })
+            else:  # "url" format
+                image_data.append({
+                    "url": img.data_url if hasattr(img, 'data_url') else f"data:{img.mime_type};base64,{img.data}",
+                })
+
+        return {
+            "created": _unix_ts(),
+            "data": image_data
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Image variation failed: {str(e)}")
 
 
 @app.post("/v1/moderations")
