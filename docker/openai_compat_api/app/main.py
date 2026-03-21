@@ -1,5 +1,6 @@
 import os
 from contextlib import asynccontextmanager
+from fastapi import FastAPI
 
 from gemini_webapi import GeminiClient
 
