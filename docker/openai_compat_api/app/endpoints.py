@@ -8,15 +8,15 @@ import orjson
 
 from gemini_webapi import GeminiClient
 
-from .models import (
+from models import (
     ChatCompletionRequest,
     CompletionRequest,
     ModerationRequest,
     EmbeddingRequest,
     ImageGenerationRequest,
 )
-from .utils import _require_auth, _messages_to_prompt, _estimate_tokens, _estimate_cost, _unix_ts
-from .usage_tracker import UsageTracker
+from utils import _require_auth, _messages_to_prompt, _estimate_tokens, _estimate_cost, _unix_ts
+from usage_tracker import UsageTracker
 
 
 class AppState:

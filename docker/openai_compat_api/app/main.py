@@ -4,7 +4,7 @@ from fastapi import FastAPI
 
 from gemini_webapi import GeminiClient
 
-from .endpoints import state
+from endpoints import state
 
 
 async def _create_client() -> GeminiClient:
@@ -34,4 +34,4 @@ app = FastAPI(title="Gemini OpenAI-compatible API", lifespan=lifespan)
 
 
 # Import all endpoints to register them with the app
-from . import endpoints
+import endpoints
