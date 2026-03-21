@@ -16,4 +16,4 @@ COPY docker/openai_compat_api/app /app
 
 EXPOSE 8080
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]

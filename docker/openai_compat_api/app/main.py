@@ -1,10 +1,10 @@
 import os
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
 
 from gemini_webapi import GeminiClient
 
 from endpoints import state
+from app import app
 
 
 async def _create_client() -> GeminiClient:
@@ -30,8 +30,4 @@ async def lifespan(_: FastAPI):
             await state.client.close()
 
 
-app = FastAPI(title="Gemini OpenAI-compatible API", lifespan=lifespan)
-
-
-# Import all endpoints to register them with the app
-import endpoints
+app.router.lifespan_context = lifespan

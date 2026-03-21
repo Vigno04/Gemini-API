@@ -8,6 +8,8 @@ import orjson
 
 from gemini_webapi import GeminiClient
 
+from app import app
+
 from models import (
     ChatCompletionRequest,
     CompletionRequest,
