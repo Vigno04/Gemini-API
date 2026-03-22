@@ -299,14 +299,18 @@ async def chat_completions(
                     full_response_text += image_string
                     full_content += image_string
                     
-                    payload_chunk = {
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [{"index": 0, "delta": {"content": image_string}, "finish_reason": None}],
-                    }
-                    yield b"data: " + orjson.dumps(payload_chunk) + b"\n\n"
+                    # Split the large base64 string into smaller chunks for SSE delivery
+                    chunk_size = 8192
+                    for i in range(0, len(image_string), chunk_size):
+                        part = image_string[i:i+chunk_size]
+                        payload_chunk = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [{"index": 0, "delta": {"content": part}, "finish_reason": None}],
+                        }
+                        yield b"data: " + orjson.dumps(payload_chunk) + b"\n\n"
 
             # Chunk finale con token calcolati
             prompt_tokens = _estimate_tokens(prompt)
@@ -538,14 +542,18 @@ async def completions(
                     full_response_text += image_string
                     full_content += image_string
                     
-                    payload_chunk = {
-                        "id": completion_id,
-                        "object": "text_completion",
-                        "created": created,
-                        "model": model,
-                        "choices": [{"index": 0, "text": image_string, "finish_reason": None}],
-                    }
-                    yield b"data: " + orjson.dumps(payload_chunk) + b"\n\n"
+                    # Split the large base64 string into smaller chunks for SSE delivery
+                    chunk_size = 8192
+                    for i in range(0, len(image_string), chunk_size):
+                        part = image_string[i:i+chunk_size]
+                        payload_chunk = {
+                            "id": completion_id,
+                            "object": "text_completion",
+                            "created": created,
+                            "model": model,
+                            "choices": [{"index": 0, "text": part, "finish_reason": None}],
+                        }
+                        yield b"data: " + orjson.dumps(payload_chunk) + b"\n\n"
 
             # Chunk finale con token calcolati
             prompt_tokens = _estimate_tokens(payload.prompt)
