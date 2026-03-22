@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 from fastapi import Header, HTTPException, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
-from fastapi.background import BackgroundTask
+from starlette.background import BackgroundTask
 import orjson
 
 from gemini_webapi import GeminiClient
