@@ -18,6 +18,8 @@ def _debug_enabled() -> bool:
     return os.getenv("OPENAI_COMPAT_DEBUG", "false").lower() in ("true", "1", "yes")
 
 
+import re
+
 def _debug_dump_request(endpoint: str, payload: Any) -> None:
     """Dump full request payload for debugging when enabled."""
     if not _debug_enabled():
@@ -31,7 +33,8 @@ def _debug_dump_request(endpoint: str, payload: Any) -> None:
         serialized = json.dumps(normalized, ensure_ascii=True, default=str)
     except Exception:
         serialized = str(normalized)
-
+        
+    serialized = re.sub(r'data:image/[^;]+;base64,[A-Za-z0-9+/=]+', 'data:image/...;base64,...[truncated]', serialized)
     print(f"[DEBUG][REQUEST] {endpoint} {serialized}")
 
 
@@ -49,6 +52,7 @@ def _debug_dump_response(endpoint: str, payload: Any) -> None:
     except Exception:
         serialized = str(normalized)
 
+    serialized = re.sub(r'data:image/[^;]+;base64,[A-Za-z0-9+/=]+', 'data:image/...;base64,...[truncated]', serialized)
     print(f"[DEBUG][RESPONSE] {endpoint} {serialized}")
 
 

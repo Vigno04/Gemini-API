@@ -185,6 +185,7 @@ async def chat_completions(
         prompt += "\n\n(IMPORTANT: Please respond with a valid JSON object.)"
 
     use_temporary_chats = os.getenv("OPENAI_COMPAT_USE_TEMPORARY_CHATS", "true").lower() == "true"
+    inline_images = _env_flag("OPENAI_COMPAT_INLINE_IMAGES", True)
 
     stream_enabled = _effective_stream(payload.stream)
 
@@ -280,7 +281,7 @@ async def chat_completions(
             else:
                 full_content = full_response_text
 
-            if streamed_images:
+            if inline_images and streamed_images:
                 image_markdown_list = []
                 for img in streamed_images:
                     try:
@@ -380,7 +381,7 @@ async def chat_completions(
         full_content = text
 
     # Add generated images to the response if any
-    if output.images:
+    if inline_images and output.images:
         image_markdown_list = []
         for img in output.images:
             try:
@@ -448,6 +449,7 @@ async def completions(
 
     model = payload.model or os.getenv("OPENAI_COMPAT_DEFAULT_MODEL", "gemini-3-flash")
     use_temporary_chats = os.getenv("OPENAI_COMPAT_USE_TEMPORARY_CHATS", "true").lower() == "true"
+    inline_images = _env_flag("OPENAI_COMPAT_INLINE_IMAGES", True)
 
     stream_enabled = _effective_stream(payload.stream)
 
@@ -524,7 +526,7 @@ async def completions(
             else:
                 full_content = full_response_text
 
-            if streamed_images:
+            if inline_images and streamed_images:
                 image_markdown_list = []
                 for img in streamed_images:
                     try:
@@ -608,7 +610,7 @@ async def completions(
         full_content = text
 
     # Add generated images to the response if any
-    if output.images:
+    if inline_images and output.images:
         image_markdown_list = []
         for img in output.images:
             try:
