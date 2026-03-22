@@ -196,19 +196,53 @@ async def chat_completions(
         async def stream_events():
             full_response_text = ""  # Accumula il testo completo
             full_response_thoughts = ""  # Accumula i pensieri completi
+            thought_started = False
+            thought_ended = False
+
             async for chunk in client.generate_content_stream(
                 prompt=prompt,
                 model=model,
                 temporary=use_temporary_chats,
             ):
-                delta = chunk.text_delta
+                delta = chunk.text_delta or ""
                 thoughts_delta = chunk.thoughts_delta or ""
+
+                content_to_send = ""
+
+                if thoughts_delta:
+                    if not thought_started:
+                        content_to_send += "<thinking>\n"
+                        thought_started = True
+                    content_to_send += thoughts_delta
+
+                if delta:
+                    if thought_started and not thought_ended:
+                        content_to_send += "\n</thinking>\n\n"
+                        thought_ended = True
+                    content_to_send += delta
 
                 if delta:
                     full_response_text += delta  # Accumula testo
                 if thoughts_delta:
                     full_response_thoughts += thoughts_delta  # Accumula pensieri
 
+                if content_to_send:
+                    payload_chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": content_to_send},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    yield b"data: " + orjson.dumps(payload_chunk) + b"\n\n"
+
+            if thought_started and not thought_ended:
                 payload_chunk = {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
@@ -217,7 +251,7 @@ async def chat_completions(
                     "choices": [
                         {
                             "index": 0,
-                            "delta": {"content": delta} if delta else {},
+                            "delta": {"content": "\n</thinking>\n\n"},
                             "finish_reason": None,
                         }
                     ],
@@ -373,25 +407,53 @@ async def completions(
         async def stream_events():
             full_response_text = ""  # Accumula il testo completo
             full_response_thoughts = ""  # Accumula i pensieri completi
+            thought_started = False
+            thought_ended = False
+
             async for chunk in client.generate_content_stream(
                 prompt=payload.prompt,
                 model=model,
                 temporary=use_temporary_chats,
             ):
-                delta = chunk.text_delta
+                delta = chunk.text_delta or ""
                 thoughts_delta = chunk.thoughts_delta or ""
+
+                content_to_send = ""
+
+                if thoughts_delta:
+                    if not thought_started:
+                        content_to_send += "<thinking>\n"
+                        thought_started = True
+                    content_to_send += thoughts_delta
+
+                if delta:
+                    if thought_started and not thought_ended:
+                        content_to_send += "\n</thinking>\n\n"
+                        thought_ended = True
+                    content_to_send += delta
 
                 if delta:
                     full_response_text += delta  # Accumula testo
                 if thoughts_delta:
                     full_response_thoughts += thoughts_delta  # Accumula pensieri
 
+                if content_to_send:
+                    payload_chunk = {
+                        "id": completion_id,
+                        "object": "text_completion",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"index": 0, "text": content_to_send, "finish_reason": None}],
+                    }
+                    yield b"data: " + orjson.dumps(payload_chunk) + b"\n\n"
+
+            if thought_started and not thought_ended:
                 payload_chunk = {
                     "id": completion_id,
                     "object": "text_completion",
                     "created": created,
                     "model": model,
-                    "choices": [{"index": 0, "text": delta, "finish_reason": None}],
+                    "choices": [{"index": 0, "text": "\n</thinking>\n\n", "finish_reason": None}],
                 }
                 yield b"data: " + orjson.dumps(payload_chunk) + b"\n\n"
 
