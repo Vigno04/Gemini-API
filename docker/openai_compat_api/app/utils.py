@@ -90,10 +90,12 @@ def _require_auth(authorization: str | None = Header(default=None)):
 
 
 import base64
+import tempfile
+from pathlib import Path
 
-def _messages_to_prompt(messages: list) -> tuple[str, list[bytes]]:
+def _messages_to_prompt(messages: list) -> tuple[str, list[Path]]:
     rendered: list[str] = []
-    files: list[bytes] = []
+    files: list[Path] = []
     
     for msg in messages:
         role = msg.role.lower()
@@ -117,10 +119,25 @@ def _messages_to_prompt(messages: list) -> tuple[str, list[bytes]]:
                     if url.startswith("data:"):
                         try:
                             if "," in url:
-                                b64 = url.split(",", 1)[1]
-                                files.append(base64.b64decode(b64, validate=True))
-                        except Exception:
-                            # Skip invalid base64 images
+                                mime_part, b64 = url.split(",", 1)
+                                ext = ".png" # default
+                                if "image/jpeg" in mime_part:
+                                    ext = ".jpg"
+                                elif "image/webp" in mime_part:
+                                    ext = ".webp"
+                                elif "image/gif" in mime_part:
+                                    ext = ".gif"
+                                
+                                img_bytes = base64.b64decode(b64, validate=True)
+                                
+                                # Write to a temporary file locally so Gemini API can upload it
+                                tmp_fd, tmp_path_str = tempfile.mkstemp(suffix=ext, prefix="openai_compat_usr_img_")
+                                with os.fdopen(tmp_fd, 'wb') as f:
+                                    f.write(img_bytes)
+                                
+                                files.append(Path(tmp_path_str))
+                        except Exception as e:
+                            _debug_log(f"Ignoring unparseable base64 image: {e}")
                             pass
                     elif url.startswith("http://") or url.startswith("https://"):
                         # Just an informational approach for unsupported URLs: we can insert it in the text.

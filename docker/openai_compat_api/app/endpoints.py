@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 from fastapi import Header, HTTPException, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
+from fastapi.background import BackgroundTask
 import orjson
 
 from gemini_webapi import GeminiClient
@@ -358,14 +359,32 @@ async def chat_completions(
             yield b"data: " + orjson.dumps(final_chunk) + b"\n\n"
             yield b"data: [DONE]\n\n"
 
-        return StreamingResponse(stream_events(), media_type="text/event-stream")
+        def cleanup_files(file_paths):
+            for p in file_paths:
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
 
-    output = await client.generate_content(
-        prompt=prompt,
-        model=model,
-        files=files if files else None,
-        temporary=use_temporary_chats
-    )
+        return StreamingResponse(
+            stream_events(), 
+            media_type="text/event-stream",
+            background=BackgroundTask(cleanup_files, files) if files else None
+        )
+
+    try:
+        output = await client.generate_content(
+            prompt=prompt,
+            model=model,
+            files=files if files else None,
+            temporary=use_temporary_chats
+        )
+    finally:
+        for fpath in files:
+            try:
+                os.remove(fpath)
+            except Exception:
+                pass
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = _unix_ts()
