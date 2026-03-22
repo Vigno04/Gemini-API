@@ -14,12 +14,14 @@ async def _create_client() -> GeminiClient:
     proxy = os.getenv("GEMINI_PROXY") or None
 
     # Configure logging level based on debug setting
-    debug_enabled = os.getenv("OPENAI_COMPAT_DEBUG", "false").lower() == "true"
+    debug_raw = os.getenv("OPENAI_COMPAT_DEBUG", "false")
+    debug_enabled = debug_raw.strip().lower() in ("true", "1", "yes", "on")
     log_level = "DEBUG" if debug_enabled else "INFO"
     set_log_level(log_level)
 
     print(f"DEBUG: GEMINI_SECURE_1PSID present: {bool(secure_1psid)}")
     print(f"DEBUG: GEMINI_SECURE_1PSIDTS present: {bool(secure_1psidts)}")
+    print(f"INFO: OPENAI_COMPAT_DEBUG raw value: {debug_raw!r}")
     print(f"INFO: Setting Gemini log level to: {log_level}")
 
     if not secure_1psid:

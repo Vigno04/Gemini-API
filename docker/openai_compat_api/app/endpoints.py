@@ -59,13 +59,26 @@ def _extract_b64_from_data_url(data_url: str) -> str:
     return data_url.split(",", 1)[1]
 
 
+def _is_usable_image_url(value: str | None) -> bool:
+    if not value or not isinstance(value, str):
+        return False
+    candidate = value.strip()
+    if not candidate:
+        return False
+    if candidate.startswith("http://") or candidate.startswith("https://"):
+        return len(candidate) > len("https://")
+    if candidate.startswith("data:"):
+        return "," in candidate and len(candidate.split(",", 1)[1]) > 0
+    return False
+
+
 async def _image_to_openai_item(
     img: Any,
     response_format: str,
     revised_prompt: str | None = None,
 ) -> dict[str, str]:
     image_url = getattr(img, "url", None)
-    image_url = image_url if isinstance(image_url, str) and image_url else None
+    image_url = image_url if _is_usable_image_url(image_url) else None
 
     if response_format == "url":
         if image_url:

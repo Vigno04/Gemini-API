@@ -51,6 +51,12 @@ docker compose pull
 docker compose up -d
 ```
 
+If you change `.env` values (for example `OPENAI_COMPAT_DEBUG=true`), restart to apply:
+
+```powershell
+docker compose up -d --force-recreate
+```
+
 4. Test:
 
 ```powershell
