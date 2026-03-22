@@ -85,8 +85,12 @@ def _require_auth(authorization: str | None = Header(default=None)):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
-def _messages_to_prompt(messages: list) -> str:
+import base64
+
+def _messages_to_prompt(messages: list) -> tuple[str, list[bytes]]:
     rendered: list[str] = []
+    files: list[bytes] = []
+    
     for msg in messages:
         role = msg.role.lower()
         if role not in {"system", "user", "assistant"}:
@@ -95,12 +99,29 @@ def _messages_to_prompt(messages: list) -> str:
         if isinstance(msg.content, str):
             text = msg.content
         else:
-            # OpenAI-style content array support: [{"type":"text","text":"..."}, ...]
-            text_parts = [
-                str(part.get("text", ""))
-                for part in msg.content
-                if isinstance(part, dict) and part.get("type") == "text"
-            ]
+            # OpenAI-style content array support: [{"type":"text","text":"..."}, {"type":"image_url", "image_url": {"url": "..."}}]
+            text_parts = []
+            for part in msg.content:
+                if not isinstance(part, dict):
+                    continue
+                ptype = part.get("type")
+                if ptype == "text":
+                    text_parts.append(str(part.get("text", "")))
+                elif ptype == "image_url":
+                    img_url_obj = part.get("image_url", {})
+                    url = img_url_obj.get("url", "")
+                    if url.startswith("data:"):
+                        try:
+                            if "," in url:
+                                b64 = url.split(",", 1)[1]
+                                files.append(base64.b64decode(b64, validate=True))
+                        except Exception:
+                            # Skip invalid base64 images
+                            pass
+                    elif url.startswith("http://") or url.startswith("https://"):
+                        # Just an informational approach for unsupported URLs: we can insert it in the text.
+                        text_parts.append(f"[Image URL: {url}]")
+                        
             text = "".join(text_parts)
 
         if role == "system":
@@ -109,4 +130,5 @@ def _messages_to_prompt(messages: list) -> str:
             rendered.append(f"user: {text}")
         elif role == "assistant":
             rendered.append(f"assistant: {text}")
-    return "\n".join(rendered)
+            
+    return "\n".join(rendered), files

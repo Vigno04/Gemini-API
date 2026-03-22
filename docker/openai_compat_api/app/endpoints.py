@@ -179,7 +179,11 @@ async def chat_completions(
     client = state.client
 
     model = payload.model or os.getenv("OPENAI_COMPAT_DEFAULT_MODEL", "gemini-3-flash")
-    prompt = _messages_to_prompt(payload.messages)
+    prompt, files = _messages_to_prompt(payload.messages)
+    
+    if getattr(payload, "response_format", None) and payload.response_format.get("type") == "json_object":
+        prompt += "\n\n(IMPORTANT: Please respond with a valid JSON object.)"
+
     use_temporary_chats = os.getenv("OPENAI_COMPAT_USE_TEMPORARY_CHATS", "true").lower() == "true"
 
     stream_enabled = _effective_stream(payload.stream)
@@ -198,12 +202,18 @@ async def chat_completions(
             full_response_thoughts = ""  # Accumula i pensieri completi
             thought_started = False
             thought_ended = False
+            is_first_chunk = True
+            streamed_images = []
 
             async for chunk in client.generate_content_stream(
                 prompt=prompt,
                 model=model,
+                files=files if files else None,
                 temporary=use_temporary_chats,
             ):
+                if hasattr(chunk, "images") and chunk.images:
+                    streamed_images = chunk.images
+                
                 delta = chunk.text_delta or ""
                 thoughts_delta = chunk.thoughts_delta or ""
 
@@ -226,7 +236,12 @@ async def chat_completions(
                 if thoughts_delta:
                     full_response_thoughts += thoughts_delta  # Accumula pensieri
 
-                if content_to_send:
+                if content_to_send or is_first_chunk:
+                    delta_dict = {"content": content_to_send}
+                    if is_first_chunk:
+                        delta_dict["role"] = "assistant"
+                        is_first_chunk = False
+
                     payload_chunk = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
@@ -235,7 +250,7 @@ async def chat_completions(
                         "choices": [
                             {
                                 "index": 0,
-                                "delta": {"content": content_to_send},
+                                "delta": delta_dict,
                                 "finish_reason": None,
                             }
                         ],
@@ -265,23 +280,40 @@ async def chat_completions(
             else:
                 full_content = full_response_text
 
-            # Get images from a quick non-stream call (to avoid complexity in streaming)
-            try:
-                quick_output = await client.generate_content(prompt=prompt, model=model, temporary=use_temporary_chats)
-                if quick_output.images:
-                    image_markdown = "\n\n".join([
-                        f"![Generated Image]({img.url})" if hasattr(img, 'url') and img.url else
-                        f"![Generated Image](data:{getattr(img, 'mime_type', 'image/png')};base64,{getattr(img, 'data', '')})"
-                        for img in quick_output.images
-                    ])
-                    full_content += f"\n\n{image_markdown}"
-            except:
-                pass  # Ignore errors in image fetching for streaming
+            if streamed_images:
+                image_markdown_list = []
+                for img in streamed_images:
+                    if hasattr(img, "url") and getattr(img, "url") and getattr(img, "url").startswith("http"):
+                        image_markdown_list.append(f"![{getattr(img, 'alt', 'Generated Image')}]({img.url})")
+                    else:
+                        try:
+                            with tempfile.TemporaryDirectory(prefix="openai_compat_img_") as temp_dir:
+                                saved_path = await img.save(path=temp_dir)
+                                image_bytes = Path(saved_path).read_bytes()
+                                b64_data = base64.b64encode(image_bytes).decode("ascii")
+                                image_markdown_list.append(f"![Generated Image](data:image/png;base64,{b64_data})")
+                        except Exception as e:
+                            _debug_log(f"Failed to process image during stream: {e}")
+                
+                if image_markdown_list:
+                    image_string = "\n\n" + "\n\n".join(image_markdown_list)
+                    full_response_text += image_string
+                    full_content += image_string
+                    
+                    payload_chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {"content": image_string}, "finish_reason": None}],
+                    }
+                    yield b"data: " + orjson.dumps(payload_chunk) + b"\n\n"
 
             # Chunk finale con token calcolati
             prompt_tokens = _estimate_tokens(prompt)
             completion_tokens = _estimate_tokens(full_content)
             total_tokens = prompt_tokens + completion_tokens
+            reasoning_tokens = _estimate_tokens(full_response_thoughts) if full_response_thoughts else 0
 
             # Track usage
             cost = _estimate_cost(model, prompt_tokens, completion_tokens)
@@ -297,6 +329,9 @@ async def chat_completions(
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
                     "total_tokens": total_tokens,
+                    "completion_tokens_details": {
+                        "reasoning_tokens": reasoning_tokens
+                    }
                 },
             }
             _debug_dump_response(
@@ -321,7 +356,12 @@ async def chat_completions(
 
         return StreamingResponse(stream_events(), media_type="text/event-stream")
 
-    output = await client.generate_content(prompt=prompt, model=model, temporary=use_temporary_chats)
+    output = await client.generate_content(
+        prompt=prompt,
+        model=model,
+        files=files if files else None,
+        temporary=use_temporary_chats
+    )
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = _unix_ts()
@@ -338,17 +378,28 @@ async def chat_completions(
 
     # Add generated images to the response if any
     if output.images:
-        image_markdown = "\n\n".join([
-            f"![Generated Image]({img.url})" if hasattr(img, 'url') and img.url else
-            f"![Generated Image](data:{getattr(img, 'mime_type', 'image/png')};base64,{getattr(img, 'data', '')})"
-            for img in output.images
-        ])
-        full_content += f"\n\n{image_markdown}"
+        image_markdown_list = []
+        for img in output.images:
+            if hasattr(img, "url") and getattr(img, "url") and getattr(img, "url").startswith("http"):
+                image_markdown_list.append(f"![{getattr(img, 'alt', 'Generated Image')}]({img.url})")
+            else:
+                try:
+                    with tempfile.TemporaryDirectory(prefix="openai_compat_img_") as temp_dir:
+                        saved_path = await img.save(path=temp_dir)
+                        image_bytes = Path(saved_path).read_bytes()
+                        b64_data = base64.b64encode(image_bytes).decode("ascii")
+                        image_markdown_list.append(f"![Generated Image](data:image/png;base64,{b64_data})")
+                except Exception as e:
+                    _debug_log(f"Failed to process image: {e}")
+                    
+        if image_markdown_list:
+            full_content += "\n\n" + "\n\n".join(image_markdown_list)
 
     # Estimate token usage
     prompt_tokens = _estimate_tokens(prompt)
     completion_tokens = _estimate_tokens(full_content)
     total_tokens = prompt_tokens + completion_tokens
+    reasoning_tokens = _estimate_tokens(thoughts) if thoughts else 0
 
     # Track usage
     cost = _estimate_cost(model, prompt_tokens, completion_tokens)
@@ -372,6 +423,9 @@ async def chat_completions(
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": total_tokens,
+            "completion_tokens_details": {
+                "reasoning_tokens": reasoning_tokens
+            }
         },
     }
     _debug_dump_response("POST /v1/chat/completions", response_payload)
@@ -409,12 +463,16 @@ async def completions(
             full_response_thoughts = ""  # Accumula i pensieri completi
             thought_started = False
             thought_ended = False
+            streamed_images = []
 
             async for chunk in client.generate_content_stream(
                 prompt=payload.prompt,
                 model=model,
                 temporary=use_temporary_chats,
             ):
+                if hasattr(chunk, "images") and chunk.images:
+                    streamed_images = chunk.images
+                    
                 delta = chunk.text_delta or ""
                 thoughts_delta = chunk.thoughts_delta or ""
 
@@ -464,18 +522,34 @@ async def completions(
             else:
                 full_content = full_response_text
 
-            # Get images from a quick non-stream call (to avoid complexity in streaming)
-            try:
-                quick_output = await client.generate_content(prompt=payload.prompt, model=model, temporary=use_temporary_chats)
-                if quick_output.images:
-                    image_markdown = "\n\n".join([
-                        f"![Generated Image]({img.url})" if hasattr(img, 'url') and img.url else
-                        f"![Generated Image](data:{getattr(img, 'mime_type', 'image/png')};base64,{getattr(img, 'data', '')})"
-                        for img in quick_output.images
-                    ])
-                    full_content += f"\n\n{image_markdown}"
-            except:
-                pass  # Ignore errors in image fetching for streaming
+            if streamed_images:
+                image_markdown_list = []
+                for img in streamed_images:
+                    if hasattr(img, "url") and getattr(img, "url") and getattr(img, "url").startswith("http"):
+                        image_markdown_list.append(f"![{getattr(img, 'alt', 'Generated Image')}]({img.url})")
+                    else:
+                        try:
+                            with tempfile.TemporaryDirectory(prefix="openai_compat_img_") as temp_dir:
+                                saved_path = await img.save(path=temp_dir)
+                                image_bytes = Path(saved_path).read_bytes()
+                                b64_data = base64.b64encode(image_bytes).decode("ascii")
+                                image_markdown_list.append(f"![Generated Image](data:image/png;base64,{b64_data})")
+                        except Exception as e:
+                            pass
+                
+                if image_markdown_list:
+                    image_string = "\n\n" + "\n\n".join(image_markdown_list)
+                    full_response_text += image_string
+                    full_content += image_string
+                    
+                    payload_chunk = {
+                        "id": completion_id,
+                        "object": "text_completion",
+                        "created": created,
+                        "model": model,
+                        "choices": [{"index": 0, "text": image_string, "finish_reason": None}],
+                    }
+                    yield b"data: " + orjson.dumps(payload_chunk) + b"\n\n"
 
             # Chunk finale con token calcolati
             prompt_tokens = _estimate_tokens(payload.prompt)
@@ -531,12 +605,22 @@ async def completions(
 
     # Add generated images to the response if any
     if output.images:
-        image_markdown = "\n\n".join([
-            f"![Generated Image]({img.url})" if hasattr(img, 'url') and img.url else
-            f"![Generated Image](data:{getattr(img, 'mime_type', 'image/png')};base64,{getattr(img, 'data', '')})"
-            for img in output.images
-        ])
-        full_content += f"\n\n{image_markdown}"
+        image_markdown_list = []
+        for img in output.images:
+            if hasattr(img, "url") and getattr(img, "url") and getattr(img, "url").startswith("http"):
+                image_markdown_list.append(f"![{getattr(img, 'alt', 'Generated Image')}]({img.url})")
+            else:
+                try:
+                    with tempfile.TemporaryDirectory(prefix="openai_compat_img_") as temp_dir:
+                        saved_path = await img.save(path=temp_dir)
+                        image_bytes = Path(saved_path).read_bytes()
+                        b64_data = base64.b64encode(image_bytes).decode("ascii")
+                        image_markdown_list.append(f"![Generated Image](data:image/png;base64,{b64_data})")
+                except Exception as e:
+                    pass
+                    
+        if image_markdown_list:
+            full_content += "\n\n" + "\n\n".join(image_markdown_list)
 
     # Estimate token usage
     prompt_tokens = _estimate_tokens(payload.prompt)

@@ -42,6 +42,12 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: float | None = None
     stop: str | list[str] | None = None
     user: str | None = None
+    response_format: dict[str, Any] | None = None
+    seed: int | None = None
+    tools: list[Any] | None = None
+    tool_choice: str | dict[str, Any] | None = None
+    logprobs: bool | None = None
+    top_logprobs: int | None = None
 
 
 class CompletionRequest(BaseModel):
@@ -55,3 +61,6 @@ class CompletionRequest(BaseModel):
     presence_penalty: float | None = None
     stop: str | list[str] | None = None
     user: str | None = None
+    seed: int | None = None
+    logprobs: int | None = None
+    echo: bool | None = None
