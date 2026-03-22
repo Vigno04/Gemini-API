@@ -30,9 +30,8 @@ async def _create_client() -> GeminiClient:
     print("INFO: Creating GeminiClient...")
     client = GeminiClient(secure_1psid, secure_1psidts, proxy=proxy)
 
-    timeout = int(os.getenv("GEMINI_TIMEOUT", "300"))
-    print(f"INFO: Initializing GeminiClient with timeout {timeout}...")
-    await client.init(timeout=timeout, auto_close=False, auto_refresh=True)
+    print("INFO: Initializing GeminiClient...")
+    await client.init(auto_close=False, auto_refresh=True)
     print("INFO: GeminiClient initialized successfully")
 
     return client
