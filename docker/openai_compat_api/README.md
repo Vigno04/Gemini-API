@@ -26,7 +26,8 @@ Notes:
 - `GEMINI_PROXY` - Optional: Proxy URL for requests
 - `OPENAI_COMPAT_API_KEY` - Optional: API key for authentication
 - `OPENAI_COMPAT_DEFAULT_MODEL` - Optional: Default model (default: gemini-3-flash)
-- `OPENAI_COMPAT_DEBUG` - Optional: Enable detailed logging (default: false)
+- `OPENAI_COMPAT_FORCE_STREAM` - Optional: Force SSE streaming for `/v1/chat/completions` and `/v1/completions` even if `stream=false` in requests (default: false)
+- `OPENAI_COMPAT_DEBUG` - Optional: Enable detailed request/response logging and set Gemini client to DEBUG log level (default: false)
 - `OPENAI_COMPAT_USE_TEMPORARY_CHATS` - Optional: Use temporary chats (default: true)
 
 ## Quick start

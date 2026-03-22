@@ -2,7 +2,7 @@ import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
-from gemini_webapi import GeminiClient
+from gemini_webapi import GeminiClient, set_log_level
 
 from endpoints import state
 from app import app
@@ -13,8 +13,14 @@ async def _create_client() -> GeminiClient:
     secure_1psidts = os.getenv("GEMINI_SECURE_1PSIDTS")
     proxy = os.getenv("GEMINI_PROXY") or None
 
+    # Configure logging level based on debug setting
+    debug_enabled = os.getenv("OPENAI_COMPAT_DEBUG", "false").lower() == "true"
+    log_level = "DEBUG" if debug_enabled else "INFO"
+    set_log_level(log_level)
+
     print(f"DEBUG: GEMINI_SECURE_1PSID present: {bool(secure_1psid)}")
     print(f"DEBUG: GEMINI_SECURE_1PSIDTS present: {bool(secure_1psidts)}")
+    print(f"INFO: Setting Gemini log level to: {log_level}")
 
     if not secure_1psid:
         raise RuntimeError("GEMINI_SECURE_1PSID must be set.")

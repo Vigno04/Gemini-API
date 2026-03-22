@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import tiktoken
 from typing import Any
 from fastapi import Header, HTTPException
@@ -11,6 +12,44 @@ def _debug_log(message: str, *args, **kwargs):
     """Log debug messages if OPENAI_COMPAT_DEBUG is enabled"""
     if os.getenv("OPENAI_COMPAT_DEBUG", "false").lower() in ("true", "1", "yes"):
         print(f"[DEBUG] {message}", *args, **kwargs)
+
+
+def _debug_enabled() -> bool:
+    return os.getenv("OPENAI_COMPAT_DEBUG", "false").lower() in ("true", "1", "yes")
+
+
+def _debug_dump_request(endpoint: str, payload: Any) -> None:
+    """Dump full request payload for debugging when enabled."""
+    if not _debug_enabled():
+        return
+
+    normalized = payload
+    if hasattr(payload, "model_dump"):
+        normalized = payload.model_dump()
+
+    try:
+        serialized = json.dumps(normalized, ensure_ascii=True, default=str)
+    except Exception:
+        serialized = str(normalized)
+
+    print(f"[DEBUG][REQUEST] {endpoint} {serialized}")
+
+
+def _debug_dump_response(endpoint: str, payload: Any) -> None:
+    """Dump full response payload for debugging when enabled."""
+    if not _debug_enabled():
+        return
+
+    normalized = payload
+    if hasattr(payload, "model_dump"):
+        normalized = payload.model_dump()
+
+    try:
+        serialized = json.dumps(normalized, ensure_ascii=True, default=str)
+    except Exception:
+        serialized = str(normalized)
+
+    print(f"[DEBUG][RESPONSE] {endpoint} {serialized}")
 
 
 def _unix_ts() -> int:

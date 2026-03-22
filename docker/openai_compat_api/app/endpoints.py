@@ -1,6 +1,9 @@
 import os
 import uuid
 import base64
+import tempfile
+import time
+from pathlib import Path
 from typing import Any
 from fastapi import Header, HTTPException, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
@@ -17,7 +20,16 @@ from models import (
     EmbeddingRequest,
     ImageGenerationRequest,
 )
-from utils import _require_auth, _messages_to_prompt, _estimate_tokens, _estimate_cost, _unix_ts, _debug_log
+from utils import (
+    _require_auth,
+    _messages_to_prompt,
+    _estimate_tokens,
+    _estimate_cost,
+    _unix_ts,
+    _debug_log,
+    _debug_dump_request,
+    _debug_dump_response,
+)
 from usage_tracker import UsageTracker
 
 
@@ -28,6 +40,89 @@ class AppState:
 
 
 state = AppState()
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _effective_stream(request_stream: bool) -> bool:
+    return request_stream or _env_flag("OPENAI_COMPAT_FORCE_STREAM", False)
+
+
+def _extract_b64_from_data_url(data_url: str) -> str:
+    if not data_url.startswith("data:") or "," not in data_url:
+        raise ValueError("Invalid data URL")
+    return data_url.split(",", 1)[1]
+
+
+async def _image_to_openai_item(
+    img: Any,
+    response_format: str,
+    revised_prompt: str | None = None,
+) -> dict[str, str]:
+    image_url = getattr(img, "url", None)
+    image_url = image_url if isinstance(image_url, str) and image_url else None
+
+    if response_format == "url":
+        if image_url:
+            item = {"url": image_url}
+        else:
+            with tempfile.TemporaryDirectory(prefix="openai_compat_img_") as temp_dir:
+                saved_path = await img.save(path=temp_dir)
+                image_bytes = Path(saved_path).read_bytes()
+                b64_data = base64.b64encode(image_bytes).decode("ascii")
+            item = {"url": f"data:image/png;base64,{b64_data}"}
+    else:
+        b64_data = None
+        if image_url and image_url.startswith("data:"):
+            b64_data = _extract_b64_from_data_url(image_url)
+        else:
+            with tempfile.TemporaryDirectory(prefix="openai_compat_img_") as temp_dir:
+                saved_path = await img.save(path=temp_dir)
+                image_bytes = Path(saved_path).read_bytes()
+                b64_data = base64.b64encode(image_bytes).decode("ascii")
+
+        item = {"b64_json": b64_data}
+
+    if revised_prompt is not None:
+        item["revised_prompt"] = revised_prompt
+
+    return item
+
+
+def _validate_image_response_format(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized not in {"url", "b64_json"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid response_format. Supported values: url, b64_json",
+        )
+    return normalized
+
+
+async def _read_image_payload(value: str | UploadFile, field_name: str) -> bytes:
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            raise HTTPException(status_code=400, detail=f"{field_name} is empty")
+
+        try:
+            if raw.startswith("data:"):
+                return base64.b64decode(_extract_b64_from_data_url(raw), validate=True)
+            if raw.startswith("http://") or raw.startswith("https://"):
+                raise HTTPException(status_code=400, detail=f"URL {field_name} is not supported")
+            return base64.b64decode(raw, validate=True)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid {field_name} format") from exc
+
+    data = await value.read()
+    if not data:
+        raise HTTPException(status_code=400, detail=f"{field_name} file is empty")
+    return data
 
 
 @app.get("/health")
@@ -64,6 +159,7 @@ async def chat_completions(
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     _require_auth(authorization)
+    _debug_dump_request("POST /v1/chat/completions", payload)
 
     if state.client is None:
         raise HTTPException(status_code=503, detail="Gemini client is not initialized")
@@ -73,9 +169,14 @@ async def chat_completions(
     prompt = _messages_to_prompt(payload.messages)
     use_temporary_chats = os.getenv("OPENAI_COMPAT_USE_TEMPORARY_CHATS", "true").lower() == "true"
 
-    _debug_log(f"Chat completion request: model={model}, messages={len(payload.messages)}, stream={payload.stream}")
+    stream_enabled = _effective_stream(payload.stream)
 
-    if payload.stream:
+    _debug_log(
+        f"Chat completion request: model={model}, messages={len(payload.messages)}, "
+        f"stream_requested={payload.stream}, stream_enabled={stream_enabled}"
+    )
+
+    if stream_enabled:
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = _unix_ts()
 
@@ -151,6 +252,23 @@ async def chat_completions(
                     "total_tokens": total_tokens,
                 },
             }
+            _debug_dump_response(
+                "POST /v1/chat/completions (stream final)",
+                {
+                    "id": completion_id,
+                    "object": "chat.completion",
+                    "created": created,
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": full_content},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": final_chunk["usage"],
+                },
+            )
             yield b"data: " + orjson.dumps(final_chunk) + b"\n\n"
             yield b"data: [DONE]\n\n"
 
@@ -191,7 +309,7 @@ async def chat_completions(
 
     _debug_log(f"Chat completion response: id={completion_id}, tokens={total_tokens}, images={len(output.images) if hasattr(output, 'images') else 0}")
 
-    return {
+    response_payload = {
         "id": completion_id,
         "object": "chat.completion",
         "created": created,
@@ -209,6 +327,8 @@ async def chat_completions(
             "total_tokens": total_tokens,
         },
     }
+    _debug_dump_response("POST /v1/chat/completions", response_payload)
+    return response_payload
 
 
 @app.post("/v1/completions")
@@ -217,6 +337,7 @@ async def completions(
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     _require_auth(authorization)
+    _debug_dump_request("POST /v1/completions", payload)
 
     if state.client is None:
         raise HTTPException(status_code=503, detail="Gemini client is not initialized")
@@ -225,7 +346,14 @@ async def completions(
     model = payload.model or os.getenv("OPENAI_COMPAT_DEFAULT_MODEL", "gemini-3-flash")
     use_temporary_chats = os.getenv("OPENAI_COMPAT_USE_TEMPORARY_CHATS", "true").lower() == "true"
 
-    if payload.stream:
+    stream_enabled = _effective_stream(payload.stream)
+
+    _debug_log(
+        f"Completion request: model={model}, stream_requested={payload.stream}, "
+        f"stream_enabled={stream_enabled}"
+    )
+
+    if stream_enabled:
         completion_id = f"cmpl-{uuid.uuid4().hex}"
         created = _unix_ts()
 
@@ -295,6 +423,17 @@ async def completions(
                     "total_tokens": total_tokens,
                 },
             }
+            _debug_dump_response(
+                "POST /v1/completions (stream final)",
+                {
+                    "id": completion_id,
+                    "object": "text_completion",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "text": full_content, "finish_reason": "stop"}],
+                    "usage": final_chunk["usage"],
+                },
+            )
             yield b"data: " + orjson.dumps(final_chunk) + b"\n\n"
             yield b"data: [DONE]\n\n"
 
@@ -333,7 +472,7 @@ async def completions(
     cost = _estimate_cost(model, prompt_tokens, completion_tokens)
     state.usage_tracker.track_request(model, prompt_tokens, completion_tokens, cost)
 
-    return {
+    response_payload = {
         "id": completion_id,
         "object": "text_completion",
         "created": created,
@@ -345,6 +484,8 @@ async def completions(
             "total_tokens": total_tokens,
         },
     }
+    _debug_dump_response("POST /v1/completions", response_payload)
+    return response_payload
 
 
 @app.post("/v1/images/generations")
@@ -353,48 +494,49 @@ async def create_image(
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     _require_auth(authorization)
+    _debug_dump_request("POST /v1/images/generations", payload)
 
     if state.client is None:
         raise HTTPException(status_code=503, detail="Gemini client is not initialized")
     client = state.client
 
-    # Use Gemini to generate image with a prompt that encourages image generation
-    image_prompt = f"Generate an image based on this description: {payload.prompt}"
+    response_format = _validate_image_response_format(payload.response_format)
+    use_temporary_chats = _env_flag("OPENAI_COMPAT_USE_TEMPORARY_CHATS", True)
 
-    _debug_log(f"Image generation request: prompt='{payload.prompt[:50]}...', model={payload.model}")
+    _debug_log(
+        f"Image generation request: prompt='{payload.prompt[:50]}...', model={payload.model}, "
+        f"n={payload.n}, response_format={response_format}"
+    )
 
-    try:
-        output = await client.generate_content(
-            prompt=image_prompt,
-            model=payload.model,
-            temporary=True  # Use temporary chats for image generation
+    output = await client.generate_content(
+        prompt=payload.prompt,
+        model=payload.model,
+        temporary=use_temporary_chats,
+    )
+
+    if not output.images:
+        raise HTTPException(
+            status_code=500,
+            detail="No image was generated. Try rephrasing your prompt.",
         )
 
-        # Check if Gemini generated any images
-        if not output.images:
-            raise HTTPException(
-                status_code=500,
-                detail="No image was generated. Try rephrasing your prompt."
+    requested_count = max(1, min(payload.n, len(output.images)))
+    data_items = []
+    for image in output.images[:requested_count]:
+        data_items.append(
+            await _image_to_openai_item(
+                image,
+                response_format=response_format,
+                revised_prompt=payload.prompt,
             )
+        )
 
-        # Convert Gemini images to OpenAI-compatible format
-        image_data = []
-        for img in output.images:
-            # Gemini returns images as data URLs or similar
-            # For OpenAI compatibility, we return the image data
-            image_data.append({
-                "url": img.data_url if hasattr(img, 'data_url') else f"data:{img.mime_type};base64,{img.data}",
-                "revised_prompt": payload.prompt  # Gemini doesn't revise prompts like DALL-E
-            })
-
-        return {
-            "created": _unix_ts(),
-            "data": image_data
-        }
-
-    except Exception as e:
-        _debug_log(f"Image generation failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Image generation failed: {str(e)}")
+    response_payload = {
+        "created": _unix_ts(),
+        "data": data_items,
+    }
+    _debug_dump_response("POST /v1/images/generations", response_payload)
+    return response_payload
 
 
 @app.post("/v1/images/edits")
@@ -411,89 +553,105 @@ async def edit_image(
 ) -> dict[str, Any]:
     _require_auth(authorization)
 
+    image_debug: dict[str, Any]
+    if not isinstance(image, str):
+        image_upload: Any = image
+        image_bytes_for_debug = await image_upload.read()
+        image_debug = {
+            "type": "upload",
+            "filename": image_upload.filename,
+            "content_type": image_upload.content_type,
+            "byte_length": len(image_bytes_for_debug),
+        }
+        await image_upload.seek(0)
+    else:
+        image_debug = {
+            "type": "string",
+            "value": image,
+        }
+
+    mask_debug: dict[str, Any] | None = None
+    if mask is not None:
+        if not isinstance(mask, str):
+            mask_upload: Any = mask
+            mask_bytes_for_debug = await mask_upload.read()
+            mask_debug = {
+                "type": "upload",
+                "filename": mask_upload.filename,
+                "content_type": mask_upload.content_type,
+                "byte_length": len(mask_bytes_for_debug),
+            }
+            await mask_upload.seek(0)
+        else:
+            mask_debug = {
+                "type": "string",
+                "value": mask,
+            }
+
+    _debug_dump_request(
+        "POST /v1/images/edits",
+        {
+            "prompt": prompt,
+            "model": model,
+            "n": n,
+            "size": size,
+            "response_format": response_format,
+            "user": user,
+            "image": image_debug,
+            "mask": mask_debug,
+        },
+    )
+
     if state.client is None:
         raise HTTPException(status_code=503, detail="Gemini client is not initialized")
     client = state.client
 
-    _debug_log(f"Image edit request: prompt='{prompt[:50] if prompt else None}...', model={model}, has_mask={mask is not None}")
+    response_format = _validate_image_response_format(response_format)
+    use_temporary_chats = _env_flag("OPENAI_COMPAT_USE_TEMPORARY_CHATS", True)
 
-    try:
-        # Handle image input (file upload, base64, or URL)
-        if isinstance(image, UploadFile):
-            image_data = await image.read()
-        elif isinstance(image, str):
-            if image.startswith("data:"):
-                # Base64 data URL
-                header, base64_data = image.split(",", 1)
-                image_data = base64.b64decode(base64_data)
-            elif image.startswith("http"):
-                # URL - would need to download, but for now raise error
-                raise HTTPException(status_code=400, detail="URL images not yet supported for edits")
-            else:
-                # Assume base64 string
-                image_data = base64.b64decode(image)
-        else:
-            raise HTTPException(status_code=400, detail="Invalid image format")
+    _debug_log(
+        f"Image edit request: prompt='{prompt[:50] if prompt else None}...', model={model}, "
+        f"n={n}, response_format={response_format}, has_mask={mask is not None}"
+    )
 
-        # Handle mask input if provided
-        mask_data = None
-        if mask is not None:
-            if isinstance(mask, UploadFile):
-                mask_data = await mask.read()
-            elif isinstance(mask, str):
-                if mask.startswith("data:"):
-                    header, base64_data = mask.split(",", 1)
-                    mask_data = base64.b64decode(base64_data)
-                elif mask.startswith("http"):
-                    raise HTTPException(status_code=400, detail="URL masks not yet supported")
-                else:
-                    mask_data = base64.b64decode(mask)
+    image_bytes = await _read_image_payload(image, "image")
 
-        # Prepare the prompt for editing
-        edit_prompt = f"Edit this image: {prompt}" if prompt else "Modify this image"
+    if mask is not None:
+        # Validate mask input for better client compatibility, even if not used by Gemini.
+        await _read_image_payload(mask, "mask")
 
-        # Note: Gemini doesn't have built-in mask support like DALL-E
-        # For now, we'll ignore the mask and just use the prompt
-        if mask_data:
-            # Could potentially use mask in future implementation
-            pass
+    edit_prompt = prompt or "Edit this image"
 
-        # Use Gemini to edit the image
-        output = await client.generate_content(
-            prompt=edit_prompt,
-            model=model,
-            files=[image_data],  # Pass the existing image as file data
-            temporary=True
+    output = await client.generate_content(
+        prompt=edit_prompt,
+        model=model,
+        files=[image_bytes],
+        temporary=use_temporary_chats,
+    )
+
+    if not output.images:
+        raise HTTPException(
+            status_code=500,
+            detail="No edited image was generated. Try rephrasing your prompt.",
         )
 
-        if not output.images:
-            raise HTTPException(
-                status_code=500,
-                detail="No edited image was generated. Try rephrasing your prompt."
+    requested_count = max(1, min(n, len(output.images)))
+    data_items = []
+    for generated in output.images[:requested_count]:
+        data_items.append(
+            await _image_to_openai_item(
+                generated,
+                response_format=response_format,
+                revised_prompt=prompt or "",
             )
+        )
 
-        # Convert to OpenAI-compatible format
-        image_data = []
-        for img in output.images:
-            if response_format == "b64_json":
-                image_data.append({
-                    "b64_json": img.data if hasattr(img, 'data') else "",
-                    "revised_prompt": prompt or ""
-                })
-            else:  # "url" format
-                image_data.append({
-                    "url": img.data_url if hasattr(img, 'data_url') else f"data:{img.mime_type};base64,{img.data}",
-                    "revised_prompt": prompt or ""
-                })
-
-        return {
-            "created": _unix_ts(),
-            "data": image_data
-        }
-
-    except Exception as e:
-        _debug_log(f"Image edit failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Image editing failed: {str(e)}")
+    response_payload = {
+        "created": _unix_ts(),
+        "data": data_items,
+    }
+    _debug_dump_response("POST /v1/images/edits", response_payload)
+    return response_payload
 
 
 @app.post("/v1/images/variations")
@@ -508,67 +666,79 @@ async def create_image_variations(
 ) -> dict[str, Any]:
     _require_auth(authorization)
 
+    image_debug: dict[str, Any]
+    if not isinstance(image, str):
+        image_upload: Any = image
+        image_bytes_for_debug = await image_upload.read()
+        image_debug = {
+            "type": "upload",
+            "filename": image_upload.filename,
+            "content_type": image_upload.content_type,
+            "byte_length": len(image_bytes_for_debug),
+        }
+        await image_upload.seek(0)
+    else:
+        image_debug = {
+            "type": "string",
+            "value": image,
+        }
+
+    _debug_dump_request(
+        "POST /v1/images/variations",
+        {
+            "model": model,
+            "n": n,
+            "size": size,
+            "response_format": response_format,
+            "user": user,
+            "image": image_debug,
+        },
+    )
+
     if state.client is None:
         raise HTTPException(status_code=503, detail="Gemini client is not initialized")
     client = state.client
 
-    _debug_log(f"Image variations request: model={model}")
+    response_format = _validate_image_response_format(response_format)
+    use_temporary_chats = _env_flag("OPENAI_COMPAT_USE_TEMPORARY_CHATS", True)
 
-    try:
-        # Handle image input (file upload, base64, or URL)
-        if isinstance(image, UploadFile):
-            image_data = await image.read()
-        elif isinstance(image, str):
-            if image.startswith("data:"):
-                # Base64 data URL
-                header, base64_data = image.split(",", 1)
-                image_data = base64.b64decode(base64_data)
-            elif image.startswith("http"):
-                # URL - would need to download, but for now raise error
-                raise HTTPException(status_code=400, detail="URL images not yet supported for variations")
-            else:
-                # Assume base64 string
-                image_data = base64.b64decode(image)
-        else:
-            raise HTTPException(status_code=400, detail="Invalid image format")
+    _debug_log(
+        f"Image variations request: model={model}, n={n}, response_format={response_format}"
+    )
 
-        # Create variations prompt
-        variation_prompt = "Create variations of this image with different styles, colors, or compositions"
+    image_bytes = await _read_image_payload(image, "image")
 
-        # Generate variations using Gemini
-        output = await client.generate_content(
-            prompt=variation_prompt,
-            model=model,
-            files=[image_data],  # Pass the existing image as file data
-            temporary=True
+    variation_prompt = "Create image variations while preserving the main subject and style."
+
+    output = await client.generate_content(
+        prompt=variation_prompt,
+        model=model,
+        files=[image_bytes],
+        temporary=use_temporary_chats,
+    )
+
+    if not output.images:
+        raise HTTPException(
+            status_code=500,
+            detail="No image variations were generated.",
         )
 
-        if not output.images:
-            raise HTTPException(
-                status_code=500,
-                detail="No image variations were generated."
+    requested_count = max(1, min(n, len(output.images)))
+    data_items = []
+    for generated in output.images[:requested_count]:
+        data_items.append(
+            await _image_to_openai_item(
+                generated,
+                response_format=response_format,
             )
+        )
 
-        # Convert to OpenAI-compatible format
-        image_data = []
-        for img in output.images:
-            if response_format == "b64_json":
-                image_data.append({
-                    "b64_json": img.data if hasattr(img, 'data') else "",
-                })
-            else:  # "url" format
-                image_data.append({
-                    "url": img.data_url if hasattr(img, 'data_url') else f"data:{img.mime_type};base64,{img.data}",
-                })
-
-        return {
-            "created": _unix_ts(),
-            "data": image_data
-        }
-
-    except Exception as e:
-        _debug_log(f"Image variations failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Image variation failed: {str(e)}")
+    response_payload = {
+        "created": _unix_ts(),
+        "data": data_items,
+    }
+    _debug_dump_response("POST /v1/images/variations", response_payload)
+    return response_payload
 
 
 @app.post("/v1/moderations")

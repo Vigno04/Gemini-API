@@ -27,6 +27,8 @@ class ImageGenerationRequest(BaseModel):
     size: str = "1024x1024"  # Ignored for Gemini, but kept for compatibility
     quality: str = "standard"  # Ignored for Gemini
     style: str = "natural"  # Ignored for Gemini
+    response_format: str = "url"  # OpenAI-compatible: url | b64_json
+    user: str | None = None
 
 
 class ChatCompletionRequest(BaseModel):
