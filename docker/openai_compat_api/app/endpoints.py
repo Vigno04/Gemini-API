@@ -283,17 +283,16 @@ async def chat_completions(
             if streamed_images:
                 image_markdown_list = []
                 for img in streamed_images:
-                    if hasattr(img, "url") and getattr(img, "url") and getattr(img, "url").startswith("http"):
-                        image_markdown_list.append(f"![{getattr(img, 'alt', 'Generated Image')}]({img.url})")
-                    else:
-                        try:
-                            with tempfile.TemporaryDirectory(prefix="openai_compat_img_") as temp_dir:
-                                saved_path = await img.save(path=temp_dir)
-                                image_bytes = Path(saved_path).read_bytes()
-                                b64_data = base64.b64encode(image_bytes).decode("ascii")
-                                image_markdown_list.append(f"![Generated Image](data:image/png;base64,{b64_data})")
-                        except Exception as e:
-                            _debug_log(f"Failed to process image during stream: {e}")
+                    try:
+                        with tempfile.TemporaryDirectory(prefix="openai_compat_img_") as temp_dir:
+                            saved_path = await img.save(path=temp_dir)
+                            image_bytes = Path(saved_path).read_bytes()
+                            b64_data = base64.b64encode(image_bytes).decode("ascii")
+                            image_markdown_list.append(f"![Generated Image](data:image/png;base64,{b64_data})")
+                    except Exception as e:
+                        _debug_log(f"Failed to process image during stream: {e}")
+                        if hasattr(img, "url") and getattr(img, "url") and getattr(img, "url").startswith("http"):
+                            image_markdown_list.append(f"![{getattr(img, 'alt', 'Generated Image')}]({img.url})")
                 
                 if image_markdown_list:
                     image_string = "\n\n" + "\n\n".join(image_markdown_list)
@@ -380,17 +379,16 @@ async def chat_completions(
     if output.images:
         image_markdown_list = []
         for img in output.images:
-            if hasattr(img, "url") and getattr(img, "url") and getattr(img, "url").startswith("http"):
-                image_markdown_list.append(f"![{getattr(img, 'alt', 'Generated Image')}]({img.url})")
-            else:
-                try:
-                    with tempfile.TemporaryDirectory(prefix="openai_compat_img_") as temp_dir:
-                        saved_path = await img.save(path=temp_dir)
-                        image_bytes = Path(saved_path).read_bytes()
-                        b64_data = base64.b64encode(image_bytes).decode("ascii")
-                        image_markdown_list.append(f"![Generated Image](data:image/png;base64,{b64_data})")
-                except Exception as e:
-                    _debug_log(f"Failed to process image: {e}")
+            try:
+                with tempfile.TemporaryDirectory(prefix="openai_compat_img_") as temp_dir:
+                    saved_path = await img.save(path=temp_dir)
+                    image_bytes = Path(saved_path).read_bytes()
+                    b64_data = base64.b64encode(image_bytes).decode("ascii")
+                    image_markdown_list.append(f"![Generated Image](data:image/png;base64,{b64_data})")
+            except Exception as e:
+                _debug_log(f"Failed to process image: {e}")
+                if hasattr(img, "url") and getattr(img, "url") and getattr(img, "url").startswith("http"):
+                    image_markdown_list.append(f"![{getattr(img, 'alt', 'Generated Image')}]({img.url})")
                     
         if image_markdown_list:
             full_content += "\n\n" + "\n\n".join(image_markdown_list)
@@ -525,17 +523,15 @@ async def completions(
             if streamed_images:
                 image_markdown_list = []
                 for img in streamed_images:
-                    if hasattr(img, "url") and getattr(img, "url") and getattr(img, "url").startswith("http"):
-                        image_markdown_list.append(f"![{getattr(img, 'alt', 'Generated Image')}]({img.url})")
-                    else:
-                        try:
-                            with tempfile.TemporaryDirectory(prefix="openai_compat_img_") as temp_dir:
-                                saved_path = await img.save(path=temp_dir)
-                                image_bytes = Path(saved_path).read_bytes()
-                                b64_data = base64.b64encode(image_bytes).decode("ascii")
-                                image_markdown_list.append(f"![Generated Image](data:image/png;base64,{b64_data})")
-                        except Exception as e:
-                            pass
+                    try:
+                        with tempfile.TemporaryDirectory(prefix="openai_compat_img_") as temp_dir:
+                            saved_path = await img.save(path=temp_dir)
+                            image_bytes = Path(saved_path).read_bytes()
+                            b64_data = base64.b64encode(image_bytes).decode("ascii")
+                            image_markdown_list.append(f"![Generated Image](data:image/png;base64,{b64_data})")
+                    except Exception as e:
+                        if hasattr(img, "url") and getattr(img, "url") and getattr(img, "url").startswith("http"):
+                            image_markdown_list.append(f"![{getattr(img, 'alt', 'Generated Image')}]({img.url})")
                 
                 if image_markdown_list:
                     image_string = "\n\n" + "\n\n".join(image_markdown_list)
@@ -607,17 +603,15 @@ async def completions(
     if output.images:
         image_markdown_list = []
         for img in output.images:
-            if hasattr(img, "url") and getattr(img, "url") and getattr(img, "url").startswith("http"):
-                image_markdown_list.append(f"![{getattr(img, 'alt', 'Generated Image')}]({img.url})")
-            else:
-                try:
-                    with tempfile.TemporaryDirectory(prefix="openai_compat_img_") as temp_dir:
-                        saved_path = await img.save(path=temp_dir)
-                        image_bytes = Path(saved_path).read_bytes()
-                        b64_data = base64.b64encode(image_bytes).decode("ascii")
-                        image_markdown_list.append(f"![Generated Image](data:image/png;base64,{b64_data})")
-                except Exception as e:
-                    pass
+            try:
+                with tempfile.TemporaryDirectory(prefix="openai_compat_img_") as temp_dir:
+                    saved_path = await img.save(path=temp_dir)
+                    image_bytes = Path(saved_path).read_bytes()
+                    b64_data = base64.b64encode(image_bytes).decode("ascii")
+                    image_markdown_list.append(f"![Generated Image](data:image/png;base64,{b64_data})")
+            except Exception as e:
+                if hasattr(img, "url") and getattr(img, "url") and getattr(img, "url").startswith("http"):
+                    image_markdown_list.append(f"![{getattr(img, 'alt', 'Generated Image')}]({img.url})")
                     
         if image_markdown_list:
             full_content += "\n\n" + "\n\n".join(image_markdown_list)
