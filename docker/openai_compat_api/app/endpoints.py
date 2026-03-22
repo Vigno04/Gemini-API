@@ -10,6 +10,7 @@ from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
 import orjson
 
+import asyncio
 from gemini_webapi import GeminiClient
 
 from app import app
@@ -201,6 +202,114 @@ async def chat_completions(
         created = _unix_ts()
 
         async def stream_events():
+            if files:
+                # Mock stream for file/image editing requests to avoid SSE framing truncations
+                try:
+                    output = await client.generate_content(
+                        prompt=prompt,
+                        model=model,
+                        files=files,
+                        temporary=use_temporary_chats
+                    )
+                except Exception as e:
+                    _debug_log(f"Failed to generate content: {e}")
+                    raise
+                
+                full_content = ""
+                thoughts = getattr(output, "thoughts", "") if return_reasoning else ""
+                
+                if thoughts:
+                    content_to_send = f"<thinking>\n{thoughts}\n</thinking>\n\n"
+                    # simulate stream for thoughts
+                    chunk_size = 64
+                    for i in range(0, len(content_to_send), chunk_size):
+                        part = content_to_send[i:i+chunk_size]
+                        payload_chunk = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [{"index": 0, "delta": {"content": part}, "finish_reason": None}],
+                        }
+                        if i == 0:
+                            payload_chunk["choices"][0]["delta"]["role"] = "assistant"
+                        yield b"data: " + orjson.dumps(payload_chunk) + b"\n\n"
+                        await asyncio.sleep(0.01)
+                    full_content += content_to_send
+                    
+                # simulate stream for text
+                text = output.text or ""
+                if text:
+                    chunk_size = 64
+                    for i in range(0, len(text), chunk_size):
+                        part = text[i:i+chunk_size]
+                        payload_chunk = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [{"index": 0, "delta": {"content": part}, "finish_reason": None}],
+                        }
+                        if not thoughts and i == 0:
+                            payload_chunk["choices"][0]["delta"]["role"] = "assistant"
+                        yield b"data: " + orjson.dumps(payload_chunk) + b"\n\n"
+                        await asyncio.sleep(0.01)
+                    full_content += text
+                    
+                # Add generated images to the response if any
+                if inline_images and hasattr(output, "images") and output.images:
+                    image_markdown_list = []
+                    for img in output.images:
+                        try:
+                            with tempfile.TemporaryDirectory(prefix="openai_compat_img_") as temp_dir:
+                                saved_path = await img.save(path=temp_dir)
+                                image_bytes = Path(saved_path).read_bytes()
+                                b64_data = base64.b64encode(image_bytes).decode("ascii")
+                                image_markdown_list.append(f"![Generated Image](data:image/png;base64,{b64_data})")
+                        except Exception as e:
+                            _debug_log(f"Failed to process image: {e}")
+                            if hasattr(img, "url") and getattr(img, "url") and getattr(img, "url").startswith("http"):
+                                image_markdown_list.append(f"![{getattr(img, 'alt', 'Generated Image')}]({img.url})")
+                                
+                    if image_markdown_list:
+                        image_string = "\n\n" + "\n\n".join(image_markdown_list)
+                        full_content += image_string
+                        
+                        chunk_size = 8192
+                        for i in range(0, len(image_string), chunk_size):
+                            part = image_string[i:i+chunk_size]
+                            payload_chunk = {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model,
+                                "choices": [{"index": 0, "delta": {"content": part}, "finish_reason": None}],
+                            }
+                            yield b"data: " + orjson.dumps(payload_chunk) + b"\n\n"
+
+                prompt_tokens = _estimate_tokens(prompt)
+                completion_tokens = _estimate_tokens(full_content)
+                total_tokens = prompt_tokens + completion_tokens
+                reasoning_tokens = _estimate_tokens(thoughts) if thoughts else 0
+                state.usage_tracker.track_request(model, prompt_tokens, completion_tokens, _estimate_cost(model, prompt_tokens, completion_tokens))
+
+                final_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    "usage": {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": total_tokens,
+                        "completion_tokens_details": {"reasoning_tokens": reasoning_tokens}
+                    },
+                }
+                yield b"data: " + orjson.dumps(final_chunk) + b"\n\n"
+                yield b"data: [DONE]\n\n"
+                return
+
             full_response_text = ""  # Accumula il testo completo
             full_response_thoughts = ""  # Accumula i pensieri completi
             thought_started = False
