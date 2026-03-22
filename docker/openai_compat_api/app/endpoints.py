@@ -187,6 +187,7 @@ async def chat_completions(
 
     use_temporary_chats = os.getenv("OPENAI_COMPAT_USE_TEMPORARY_CHATS", "true").lower() == "true"
     inline_images = _env_flag("OPENAI_COMPAT_INLINE_IMAGES", True)
+    return_reasoning = _env_flag("OPENAI_COMPAT_RETURN_REASONING", True)
 
     stream_enabled = _effective_stream(payload.stream)
 
@@ -217,7 +218,9 @@ async def chat_completions(
                     streamed_images = chunk.images
                 
                 delta = chunk.text_delta or ""
-                thoughts_delta = chunk.thoughts_delta or ""
+                thoughts_delta = chunk.thoughts_delta if return_reasoning else ""
+                if not thoughts_delta:
+                    thoughts_delta = ""
 
                 content_to_send = ""
 
@@ -390,7 +393,7 @@ async def chat_completions(
     created = _unix_ts()
 
     # Combine thoughts and text for thinking models
-    thoughts = output.thoughts
+    thoughts = output.thoughts if return_reasoning else ""
     text = output.text
     full_content = ""
 
@@ -469,6 +472,7 @@ async def completions(
     model = payload.model or os.getenv("OPENAI_COMPAT_DEFAULT_MODEL", "gemini-3-flash")
     use_temporary_chats = os.getenv("OPENAI_COMPAT_USE_TEMPORARY_CHATS", "true").lower() == "true"
     inline_images = _env_flag("OPENAI_COMPAT_INLINE_IMAGES", True)
+    return_reasoning = _env_flag("OPENAI_COMPAT_RETURN_REASONING", True)
 
     stream_enabled = _effective_stream(payload.stream)
 
@@ -497,7 +501,9 @@ async def completions(
                     streamed_images = chunk.images
                     
                 delta = chunk.text_delta or ""
-                thoughts_delta = chunk.thoughts_delta or ""
+                thoughts_delta = chunk.thoughts_delta if return_reasoning else ""
+                if not thoughts_delta:
+                    thoughts_delta = ""
 
                 content_to_send = ""
 
@@ -619,7 +625,7 @@ async def completions(
     created = _unix_ts()
 
     # Combine thoughts and text for thinking models
-    thoughts = output.thoughts
+    thoughts = output.thoughts if return_reasoning else ""
     text = output.text
     full_content = ""
 
