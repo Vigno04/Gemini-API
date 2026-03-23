@@ -130,6 +130,9 @@ def _extension_from_mime(mime_type: str | None) -> str:
         "image/gif": ".gif",
         "image/bmp": ".bmp",
         "image/tiff": ".tiff",
+        "image/avif": ".avif",
+        "image/heic": ".heic",
+        "image/heif": ".heif",
     }
     return mapping.get(mime_type.strip().lower(), ".png")
 
@@ -138,7 +141,19 @@ def _extension_from_filename(filename: str | None) -> str | None:
     if not filename:
         return None
     suffix = Path(filename).suffix.lower()
-    if suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}:
+    if suffix in {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".webp",
+        ".gif",
+        ".bmp",
+        ".tif",
+        ".tiff",
+        ".avif",
+        ".heic",
+        ".heif",
+    }:
         return ".jpg" if suffix == ".jpeg" else ".tiff" if suffix == ".tif" else suffix
     return None
 
