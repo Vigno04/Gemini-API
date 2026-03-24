@@ -29,9 +29,17 @@ Notes:
 - `OPENAI_COMPAT_FORCE_STREAM` - Optional: Force SSE streaming for `/v1/chat/completions` and `/v1/completions` even if `stream=false` in requests (default: false)
 - `OPENAI_COMPAT_GENERATION_TIMEOUT_SECONDS` - Optional: Max time for one upstream generation before returning a graceful failure (default: 120)
 - `OPENAI_COMPAT_DEBUG` - Optional: Enable detailed request/response logging and set Gemini client to DEBUG log level (default: false)
+- `OPENAI_COMPAT_SYNC_POLICY_GEMS` - Optional: On startup, sync managed policy gems (create/update/delete) used for chat policy routing (default: true)
+- `OPENAI_COMPAT_GEM_PREFIX` - Optional: Prefix for managed policy gem names (default: `openai_compat_`)
 - `OPENAI_COMPAT_USE_ACCOUNT_LANGUAGE` - Optional: Use Gemini account language from session metadata (default: true). If false and `OPENAI_COMPAT_LANGUAGE` is empty, no fixed language is sent so the model can derive language from the conversation.
 - `OPENAI_COMPAT_LANGUAGE` - Optional: Explicit language override (e.g. `it`, `en`); highest precedence.
 - `OPENAI_COMPAT_USE_TEMPORARY_CHATS` - Optional: Use temporary chats (default: true)
+
+Policy gems:
+- The container manages two custom gems at startup using `OPENAI_COMPAT_GEM_PREFIX`:
+- `<prefix>inline_images_policy`
+- `<prefix>no_inline_images_policy`
+- Requests automatically select the gem based on `OPENAI_COMPAT_INLINE_IMAGES`.
 
 ## Quick start
 

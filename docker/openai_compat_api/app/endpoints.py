@@ -39,6 +39,7 @@ class AppState:
     client: GeminiClient | None = None
     uploaded_files: dict[str, dict[str, Any]] = {}
     usage_tracker: UsageTracker = UsageTracker()
+    policy_gem_ids: dict[str, str] = {}
 
 
 state = AppState()
@@ -75,16 +76,6 @@ def _account_status_payload(client: GeminiClient | None) -> dict[str, Any] | Non
 
     return {"raw": str(account_status)}
 
-BASE_ROUTING_SYSTEM_PROMPT = (
-    "[OPENAI_COMPAT_ROUTING]\n"
-    f"For image editing or transformation of an input image, include {IMAGE_EDIT_MARKER}.\n"
-    f"For generating new images from text, include {IMAGE_GENERATION_MARKER}.\n"
-    "Do not include routing markers in user-visible output.\n"
-    "If video or audio generation is requested and no dedicated tool is provided, refuse immediately.\n"
-    "When refusing unsupported video/audio generation, use a brief plain-text refusal in the user's language."
-)
-
-
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -94,6 +85,14 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 def _effective_stream(request_stream: bool) -> bool:
     return request_stream or _env_flag("OPENAI_COMPAT_FORCE_STREAM", False)
+
+
+def _selected_policy_gem_id(inline_images: bool) -> str | None:
+    key = "inline_images" if inline_images else "no_inline_images"
+    gem_id = state.policy_gem_ids.get(key)
+    if gem_id:
+        return gem_id
+    return None
 
 
 def _generation_timeout_seconds() -> float:
@@ -242,22 +241,33 @@ def _strip_image_edit_marker(value: str | None) -> str:
     return cleaned.strip()
 
 
-def _with_routing_system_prompt(prompt: str, inline_images: bool) -> str:
-    if inline_images:
-        return (
-            f"system: {BASE_ROUTING_SYSTEM_PROMPT}\n"
-            f"{prompt}"
-        )
+def _prepend_tool_context(prompt: str, tools: list[Any] | None) -> str:
+    if not tools:
+        return prompt
 
-    inline_policy = (
-        "Do not return inline images. If an image-generation tool is available, "
-        "call the tool; otherwise, refuse the image-generation request."
+    tool_names: list[str] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        tool_type = str(tool.get("type", "")).strip().lower()
+        if tool_type != "function":
+            continue
+        function_obj = tool.get("function")
+        if not isinstance(function_obj, dict):
+            continue
+        name = str(function_obj.get("name", "")).strip()
+        if name:
+            tool_names.append(name)
+
+    if not tool_names:
+        return prompt
+
+    tools_block = (
+        "[OPENAI_COMPAT_TOOLS]\n"
+        f"Application-provided tools for this request: {', '.join(tool_names)}\n"
+        "If a required capability is available via these tools, you may rely on them."
     )
-    return (
-        f"system: {BASE_ROUTING_SYSTEM_PROMPT}\n"
-        f"system: {inline_policy}\n"
-        f"{prompt}"
-    )
+    return f"system: {tools_block}\n{prompt}"
 
 
 async def _generate_with_image_edit_routing(
@@ -266,17 +276,19 @@ async def _generate_with_image_edit_routing(
     model: str,
     files: list[Any],
     use_temporary_chats: bool,
-    inline_images: bool,
+    gem_id: str | None,
+    tools: list[Any] | None,
 ) -> tuple[Any, str]:
     """Use marker-based routing: single-turn by default, two-turn chat for image-edit intent (with or without fresh files)."""
 
-    routed_prompt = _with_routing_system_prompt(prompt, inline_images=inline_images)
+    routed_prompt = _prepend_tool_context(prompt, tools)
 
     output = await client.generate_content(
         prompt=routed_prompt,
         model=model,
         files=files if files else None,
         temporary=use_temporary_chats,
+        gem=gem_id,
     )
 
     if not _contains_image_edit_marker(output.text, output.thoughts):
@@ -288,7 +300,7 @@ async def _generate_with_image_edit_routing(
         "Image edit marker detected. Retrying prompt with two-turn chat flow."
     )
 
-    chat = client.start_chat(model=model)
+    chat = client.start_chat(model=model, gem=gem_id)
     if files:
         await chat.send_message(
             "Analyze the attached image and keep it in context for the next instruction.",
@@ -425,12 +437,13 @@ async def chat_completions(
     use_temporary_chats = os.getenv("OPENAI_COMPAT_USE_TEMPORARY_CHATS", "true").lower() == "true"
     inline_images = _env_flag("OPENAI_COMPAT_INLINE_IMAGES", True)
     return_reasoning = _env_flag("OPENAI_COMPAT_RETURN_REASONING", True)
+    gem_id = _selected_policy_gem_id(inline_images)
 
     stream_enabled = _effective_stream(payload.stream)
 
     _debug_log(
         f"Chat completion request: model={model}, messages={len(payload.messages)}, "
-        f"stream_requested={payload.stream}, stream_enabled={stream_enabled}"
+        f"stream_requested={payload.stream}, stream_enabled={stream_enabled}, gem_selected={bool(gem_id)}"
     )
 
     if stream_enabled:
@@ -447,7 +460,8 @@ async def chat_completions(
                         model=model,
                         files=files,
                         use_temporary_chats=use_temporary_chats,
-                        inline_images=inline_images,
+                        gem_id=gem_id,
+                        tools=payload.tools,
                     ),
                     timeout=generate_timeout,
                 )
@@ -633,7 +647,8 @@ async def chat_completions(
                 model=model,
                 files=files,
                 use_temporary_chats=use_temporary_chats,
-                inline_images=inline_images,
+                gem_id=gem_id,
+                tools=payload.tools,
             ),
             timeout=_generation_timeout_seconds(),
         )

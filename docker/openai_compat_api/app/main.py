@@ -6,6 +6,7 @@ from gemini_webapi import GeminiClient, set_log_level
 
 from endpoints import state
 from app import app
+from policy_gems import sync_policy_gems
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -68,6 +69,15 @@ async def _create_client() -> GeminiClient:
             "INFO: OPENAI_COMPAT_USE_ACCOUNT_LANGUAGE=false, disabling fixed language "
             f"(was {original_language!r})"
         )
+
+    if _env_flag("OPENAI_COMPAT_SYNC_POLICY_GEMS", True):
+        gem_prefix = (os.getenv("OPENAI_COMPAT_GEM_PREFIX") or "openai_compat_").strip() or "openai_compat_"
+        print(f"INFO: Syncing policy gems with prefix {gem_prefix!r}...")
+        state.policy_gem_ids = await sync_policy_gems(client, prefix=gem_prefix)
+        print(f"INFO: Policy gems ready: {state.policy_gem_ids}")
+    else:
+        state.policy_gem_ids = {}
+        print("INFO: OPENAI_COMPAT_SYNC_POLICY_GEMS=false, skipping policy gem sync.")
 
     return client
 
