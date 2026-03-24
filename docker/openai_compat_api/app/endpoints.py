@@ -224,11 +224,10 @@ def _save_temp_image_file(image_bytes: bytes, extension: str) -> Path:
 def _strip_image_edit_marker(value: str | None) -> str:
     if not value:
         return ""
-    cleaned = (
+    return (
         value.replace(IMAGE_EDIT_MARKER, "")
         .replace(IMAGE_GENERATION_MARKER, "")
     )
-    return cleaned.strip()
 
 
 def _prepend_tool_context(prompt: str, tools: list[Any] | None) -> str:
