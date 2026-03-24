@@ -3,6 +3,7 @@ import uuid
 import base64
 import tempfile
 import time
+import asyncio
 from pathlib import Path
 from typing import Any
 from fastapi import Header, HTTPException, UploadFile, File, Form
@@ -79,7 +80,8 @@ BASE_ROUTING_SYSTEM_PROMPT = (
     f"For image editing or transformation of an input image, include {IMAGE_EDIT_MARKER}.\n"
     f"For generating new images from text, include {IMAGE_GENERATION_MARKER}.\n"
     "Do not include routing markers in user-visible output.\n"
-    "If video or audio generation is requested and no dedicated tool is provided, refuse."
+    "If video or audio generation is requested and no dedicated tool is provided, refuse immediately.\n"
+    "When refusing unsupported video/audio generation, use a brief plain-text refusal in the user's language."
 )
 
 
@@ -92,6 +94,17 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 def _effective_stream(request_stream: bool) -> bool:
     return request_stream or _env_flag("OPENAI_COMPAT_FORCE_STREAM", False)
+
+
+def _generation_timeout_seconds() -> float:
+    raw = os.getenv("OPENAI_COMPAT_GENERATION_TIMEOUT_SECONDS", "120").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return 120.0
+    if value <= 0:
+        return 120.0
+    return value
 
 
 def _extract_b64_from_data_url(data_url: str) -> str:
@@ -295,6 +308,13 @@ async def _generate_with_image_edit_routing(
     return fallback, "two_turn_chat"
 
 
+def _upstream_failure_message() -> str:
+    return (
+        "I could not complete this request because the upstream Gemini stream was interrupted. "
+        "Please retry the request."
+    )
+
+
 async def _read_image_payload(value: str | UploadFile, field_name: str) -> tuple[bytes, str]:
     if isinstance(value, str):
         raw = value.strip()
@@ -416,16 +436,57 @@ async def chat_completions(
     if stream_enabled:
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = _unix_ts()
+        generate_timeout = _generation_timeout_seconds()
 
         async def stream_events():
-            output, mode_used = await _generate_with_image_edit_routing(
-                client=client,
-                prompt=prompt,
-                model=model,
-                files=files,
-                use_temporary_chats=use_temporary_chats,
-                inline_images=inline_images,
-            )
+            try:
+                output, mode_used = await asyncio.wait_for(
+                    _generate_with_image_edit_routing(
+                        client=client,
+                        prompt=prompt,
+                        model=model,
+                        files=files,
+                        use_temporary_chats=use_temporary_chats,
+                        inline_images=inline_images,
+                    ),
+                    timeout=generate_timeout,
+                )
+            except Exception as exc:
+                _debug_log(f"Upstream generation failed during stream response: {type(exc).__name__}: {exc}")
+                failure_text = _upstream_failure_message()
+
+                first_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": failure_text},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+                yield b"data: " + orjson.dumps(first_chunk) + b"\n\n"
+
+                final_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    "usage": {
+                        "prompt_tokens": _estimate_tokens(prompt),
+                        "completion_tokens": _estimate_tokens(failure_text),
+                        "total_tokens": _estimate_tokens(prompt) + _estimate_tokens(failure_text),
+                        "completion_tokens_details": {"reasoning_tokens": 0},
+                    },
+                }
+                yield b"data: " + orjson.dumps(final_chunk) + b"\n\n"
+                yield b"data: [DONE]\n\n"
+                return
+
             _debug_log(f"Stream request resolved with mode: {mode_used}")
 
             full_response_text = _strip_image_edit_marker(output.text)
@@ -565,15 +626,21 @@ async def chat_completions(
         )
 
     try:
-        output, mode_used = await _generate_with_image_edit_routing(
-            client=client,
-            prompt=prompt,
-            model=model,
-            files=files,
-            use_temporary_chats=use_temporary_chats,
-            inline_images=inline_images,
+        output, mode_used = await asyncio.wait_for(
+            _generate_with_image_edit_routing(
+                client=client,
+                prompt=prompt,
+                model=model,
+                files=files,
+                use_temporary_chats=use_temporary_chats,
+                inline_images=inline_images,
+            ),
+            timeout=_generation_timeout_seconds(),
         )
         _debug_log(f"Non-stream file request resolved with mode: {mode_used}")
+    except Exception as exc:
+        _debug_log(f"Upstream generation failed during non-stream response: {type(exc).__name__}: {exc}")
+        raise HTTPException(status_code=502, detail=_upstream_failure_message()) from exc
     finally:
         for fpath in files:
             try:
