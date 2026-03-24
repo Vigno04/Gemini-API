@@ -5,7 +5,7 @@ import tempfile
 import time
 import asyncio
 from pathlib import Path
-from typing import Any, AsyncGenerator
+from typing import Any
 from fastapi import Header, HTTPException, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
@@ -221,16 +221,6 @@ def _save_temp_image_file(image_bytes: bytes, extension: str) -> Path:
         return Path(tmp.name)
 
 
-def _contains_image_edit_marker(text: str | None, thoughts: str | None) -> bool:
-    source = f"{thoughts or ''}\n{text or ''}"
-    return IMAGE_EDIT_MARKER in source
-
-
-def _contains_image_generation_marker(text: str | None, thoughts: str | None) -> bool:
-    source = f"{thoughts or ''}\n{text or ''}"
-    return IMAGE_GENERATION_MARKER in source
-
-
 def _strip_image_edit_marker(value: str | None) -> str:
     if not value:
         return ""
@@ -268,56 +258,6 @@ def _prepend_tool_context(prompt: str, tools: list[Any] | None) -> str:
         "If a required capability is available via these tools, you may rely on them."
     )
     return f"system: {tools_block}\n{prompt}"
-
-
-async def _generate_with_image_edit_routing(
-    client: GeminiClient,
-    prompt: str,
-    model: str,
-    files: list[Any],
-    use_temporary_chats: bool,
-    gem_id: str | None,
-    tools: list[Any] | None,
-) -> tuple[Any, str]:
-    """Use marker-based routing: single-turn by default, two-turn chat for image-edit intent (with or without fresh files)."""
-
-    routed_prompt = _prepend_tool_context(prompt, tools)
-
-    output = await client.generate_content(
-        prompt=routed_prompt,
-        model=model,
-        files=files if files else None,
-        temporary=use_temporary_chats,
-        gem=gem_id,
-    )
-
-    if not _contains_image_edit_marker(output.text, output.thoughts):
-        if _contains_image_generation_marker(output.text, output.thoughts):
-            _debug_log("Image generation marker detected for request.")
-        return output, "single_turn"
-
-    _debug_log(
-        "Image edit marker detected. Retrying prompt with two-turn chat flow."
-    )
-
-    chat = client.start_chat(model=model, gem=gem_id)
-    if files:
-        await chat.send_message(
-            "Analyze the attached image and keep it in context for the next instruction.",
-            files=files,
-            temporary=use_temporary_chats,
-        )
-    else:
-        await chat.send_message(
-            "Review prior conversation context, including any previously referenced image context, and keep it in context for the next instruction.",
-            temporary=use_temporary_chats,
-        )
-
-    fallback = await chat.send_message(
-        prompt,
-        temporary=use_temporary_chats,
-    )
-    return fallback, "two_turn_chat"
 
 
 def _upstream_failure_message() -> str:
@@ -438,6 +378,8 @@ async def chat_completions(
     inline_images = _env_flag("OPENAI_COMPAT_INLINE_IMAGES", True)
     return_reasoning = _env_flag("OPENAI_COMPAT_RETURN_REASONING", True)
     gem_id = _selected_policy_gem_id(inline_images)
+    routed_prompt = _prepend_tool_context(prompt, payload.tools)
+    files_for_generation: list[Any] | None = files if files else None
 
     stream_enabled = _effective_stream(payload.stream)
 
@@ -450,81 +392,58 @@ async def chat_completions(
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = _unix_ts()
         generate_timeout = _generation_timeout_seconds()
-        stream_prompt = _prepend_tool_context(prompt, payload.tools)
 
         async def stream_events():
             try:
-                full_response_text = ""
-                full_response_thoughts = ""
-                thought_started = False
-                thought_ended = False
-                sent_role = False
-                streamed_images = []
-                files_for_stream: list[Any] | None = files if files else None
-
-                async def _stream_and_yield() -> AsyncGenerator[bytes, None]:
-                    nonlocal full_response_text, full_response_thoughts, thought_started, thought_ended, sent_role, streamed_images
-                    async for chunk in client.generate_content_stream(
-                        prompt=stream_prompt,
+                output = await asyncio.wait_for(
+                    client.generate_content(
+                        prompt=routed_prompt,
                         model=model,
-                        files=files_for_stream,
+                        files=files_for_generation,
                         temporary=use_temporary_chats,
                         gem=gem_id,
-                    ):
-                        if hasattr(chunk, "images") and chunk.images:
-                            streamed_images = chunk.images
+                    ),
+                    timeout=generate_timeout,
+                )
+                _debug_log("Stream request resolved with direct generation mode")
 
-                        delta = _strip_image_edit_marker(chunk.text_delta or "")
-                        thoughts_delta = (
-                            _strip_image_edit_marker(chunk.thoughts_delta) if return_reasoning and chunk.thoughts_delta else ""
-                        )
+                full_response_text = _strip_image_edit_marker(output.text)
+                full_response_thoughts = (
+                    _strip_image_edit_marker(output.thoughts) if return_reasoning else ""
+                )
 
-                        content_to_send = ""
-                        if thoughts_delta:
-                            if not thought_started:
-                                content_to_send += "<thinking>\n"
-                                thought_started = True
-                            content_to_send += thoughts_delta
+                full_content = ""
+                if full_response_thoughts:
+                    full_content = (
+                        f"<thinking>\n{full_response_thoughts}\n</thinking>\n\n"
+                        f"{full_response_text}"
+                    )
+                else:
+                    full_content = full_response_text
 
-                        if delta:
-                            if thought_started and not thought_ended:
-                                content_to_send += "\n</thinking>\n\n"
-                                thought_ended = True
-                            content_to_send += delta
+                first_chunk_content = full_content[:2048]
+                rest_content = full_content[2048:]
 
-                        if delta:
-                            full_response_text += delta
-                        if thoughts_delta:
-                            full_response_thoughts += thoughts_delta
-
-                        if not content_to_send:
-                            continue
-
-                        delta_payload: dict[str, Any] = {"content": content_to_send}
-                        if not sent_role:
-                            delta_payload["role"] = "assistant"
-                            sent_role = True
-
-                        payload_chunk = {
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "delta": delta_payload,
-                                    "finish_reason": None,
-                                }
-                            ],
+                payload_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": first_chunk_content},
+                            "finish_reason": None,
                         }
-                        yield b"data: " + orjson.dumps(payload_chunk) + b"\n\n"
+                    ],
+                }
+                yield b"data: " + orjson.dumps(payload_chunk) + b"\n\n"
 
-                async with asyncio.timeout(generate_timeout):
-                    async for event in _stream_and_yield():
-                        yield event
-
-                if thought_started and not thought_ended:
+                chunk_size = 2048
+                for i in range(0, len(rest_content), chunk_size):
+                    part = rest_content[i:i + chunk_size]
+                    if not part:
+                        continue
                     payload_chunk = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
@@ -533,22 +452,16 @@ async def chat_completions(
                         "choices": [
                             {
                                 "index": 0,
-                                "delta": {"content": "\n</thinking>\n\n"},
+                                "delta": {"content": part},
                                 "finish_reason": None,
                             }
                         ],
                     }
                     yield b"data: " + orjson.dumps(payload_chunk) + b"\n\n"
 
-                full_content = (
-                    f"<thinking>\n{full_response_thoughts}\n</thinking>\n\n{full_response_text}"
-                    if full_response_thoughts
-                    else full_response_text
-                )
-
-                if inline_images and streamed_images:
+                if inline_images and output.images:
                     image_markdown_list = []
-                    for img in streamed_images:
+                    for img in output.images:
                         try:
                             with tempfile.TemporaryDirectory(prefix="openai_compat_img_") as temp_dir:
                                 saved_path = await img.save(path=temp_dir)
@@ -580,7 +493,7 @@ async def chat_completions(
                             }
                             yield b"data: " + orjson.dumps(payload_chunk) + b"\n\n"
 
-                prompt_tokens = _estimate_tokens(stream_prompt)
+                prompt_tokens = _estimate_tokens(prompt)
                 completion_tokens = _estimate_tokens(full_content)
                 total_tokens = prompt_tokens + completion_tokens
                 reasoning_tokens = _estimate_tokens(full_response_thoughts) if full_response_thoughts else 0
@@ -673,19 +586,17 @@ async def chat_completions(
         )
 
     try:
-        output, mode_used = await asyncio.wait_for(
-            _generate_with_image_edit_routing(
-                client=client,
-                prompt=prompt,
+        output = await asyncio.wait_for(
+            client.generate_content(
+                prompt=routed_prompt,
                 model=model,
-                files=files,
-                use_temporary_chats=use_temporary_chats,
-                gem_id=gem_id,
-                tools=payload.tools,
+                files=files_for_generation,
+                temporary=use_temporary_chats,
+                gem=gem_id,
             ),
             timeout=_generation_timeout_seconds(),
         )
-        _debug_log(f"Non-stream file request resolved with mode: {mode_used}")
+        _debug_log("Non-stream request resolved with direct generation mode")
     except Exception as exc:
         _debug_log(f"Upstream generation failed during non-stream response: {type(exc).__name__}: {exc}")
         raise HTTPException(status_code=502, detail=_upstream_failure_message()) from exc
