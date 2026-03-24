@@ -38,6 +38,40 @@ def _upstream_failure_message() -> str:
     )
 
 
+def _collect_output_images(output: Any) -> list[Any]:
+    # Prefer generated images from any candidate, not only the currently chosen one.
+    candidates = list(getattr(output, "candidates", []) or [])
+    chosen = getattr(output, "chosen", None)
+
+    generated_pool: list[Any] = []
+    generic_pool: list[Any] = []
+
+    def _push_unique(pool: list[Any], items: list[Any]) -> None:
+        seen = {id(item) for item in pool}
+        for item in items:
+            if id(item) not in seen:
+                pool.append(item)
+                seen.add(id(item))
+
+    for idx, candidate in enumerate(candidates):
+        cand_generated = list(getattr(candidate, "generated_images", []) or [])
+        cand_images = list(getattr(candidate, "images", []) or [])
+        _debug_log(
+            "Image candidate summary: "
+            f"index={idx}, chosen={idx == chosen}, generated_images={len(cand_generated)}, images={len(cand_images)}"
+        )
+        _push_unique(generated_pool, cand_generated)
+        _push_unique(generic_pool, cand_images)
+
+    if generated_pool:
+        return generated_pool
+    if generic_pool:
+        return generic_pool
+
+    # Backward-compatible fallback for outputs without candidates.
+    return list(getattr(output, "images", []) or [])
+
+
 def _extract_b64_from_data_url(data_url: str) -> str:
     if not data_url.startswith("data:") or "," not in data_url:
         raise ValueError("Invalid data URL")
@@ -358,15 +392,17 @@ async def create_image(
         temporary=use_temporary_chats,
     )
 
-    if not output.images:
+    all_images = _collect_output_images(output)
+
+    if not all_images:
         raise HTTPException(
             status_code=500,
             detail="No image was generated. Try rephrasing your prompt.",
         )
 
-    requested_count = max(1, min(payload.n, len(output.images)))
+    requested_count = max(1, min(payload.n, len(all_images)))
     data_items = []
-    for image in output.images[:requested_count]:
+    for image in all_images[:requested_count]:
         data_items.append(
             await _image_to_openai_item(
                 image,
@@ -516,7 +552,9 @@ async def edit_image(
                 "Trying two-step chat fallback."
             )
 
-        if output is None or not getattr(output, "images", None):
+        direct_images = _collect_output_images(output) if output is not None else []
+
+        if output is None or not direct_images:
             try:
                 chat = client.start_chat(model=model)
                 await asyncio.wait_for(
@@ -550,15 +588,17 @@ async def edit_image(
         except Exception:
             pass
 
-    if not output.images:
+    all_images = _collect_output_images(output)
+
+    if not all_images:
         raise HTTPException(
             status_code=502,
             detail="No edited image was generated. Try rephrasing your prompt.",
         )
 
-    requested_count = max(1, min(n, len(output.images)))
+    requested_count = max(1, min(n, len(all_images)))
     data_items = []
-    for generated in output.images[:requested_count]:
+    for generated in all_images[:requested_count]:
         data_items.append(
             await _image_to_openai_item(
                 generated,
@@ -670,15 +710,17 @@ async def create_image_variations(
         except Exception:
             pass
 
-    if not output.images:
+    all_images = _collect_output_images(output)
+
+    if not all_images:
         raise HTTPException(
             status_code=502,
             detail="No image variations were generated.",
         )
 
-    requested_count = max(1, min(n, len(output.images)))
+    requested_count = max(1, min(n, len(all_images)))
     data_items = []
-    for generated in output.images[:requested_count]:
+    for generated in all_images[:requested_count]:
         data_items.append(
             await _image_to_openai_item(
                 generated,
