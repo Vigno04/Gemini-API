@@ -5,7 +5,7 @@ import tempfile
 import time
 import asyncio
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncGenerator
 from fastapi import Header, HTTPException, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
@@ -450,21 +450,179 @@ async def chat_completions(
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = _unix_ts()
         generate_timeout = _generation_timeout_seconds()
+        stream_prompt = _prepend_tool_context(prompt, payload.tools)
 
         async def stream_events():
             try:
-                output, mode_used = await asyncio.wait_for(
-                    _generate_with_image_edit_routing(
-                        client=client,
-                        prompt=prompt,
+                full_response_text = ""
+                full_response_thoughts = ""
+                thought_started = False
+                thought_ended = False
+                sent_role = False
+                streamed_images = []
+                files_for_stream: list[Any] | None = files if files else None
+
+                async def _stream_and_yield() -> AsyncGenerator[bytes, None]:
+                    nonlocal full_response_text, full_response_thoughts, thought_started, thought_ended, sent_role, streamed_images
+                    async for chunk in client.generate_content_stream(
+                        prompt=stream_prompt,
                         model=model,
-                        files=files,
-                        use_temporary_chats=use_temporary_chats,
-                        gem_id=gem_id,
-                        tools=payload.tools,
-                    ),
-                    timeout=generate_timeout,
+                        files=files_for_stream,
+                        temporary=use_temporary_chats,
+                        gem=gem_id,
+                    ):
+                        if hasattr(chunk, "images") and chunk.images:
+                            streamed_images = chunk.images
+
+                        delta = _strip_image_edit_marker(chunk.text_delta or "")
+                        thoughts_delta = (
+                            _strip_image_edit_marker(chunk.thoughts_delta) if return_reasoning and chunk.thoughts_delta else ""
+                        )
+
+                        content_to_send = ""
+                        if thoughts_delta:
+                            if not thought_started:
+                                content_to_send += "<thinking>\n"
+                                thought_started = True
+                            content_to_send += thoughts_delta
+
+                        if delta:
+                            if thought_started and not thought_ended:
+                                content_to_send += "\n</thinking>\n\n"
+                                thought_ended = True
+                            content_to_send += delta
+
+                        if delta:
+                            full_response_text += delta
+                        if thoughts_delta:
+                            full_response_thoughts += thoughts_delta
+
+                        if not content_to_send:
+                            continue
+
+                        delta_payload: dict[str, Any] = {"content": content_to_send}
+                        if not sent_role:
+                            delta_payload["role"] = "assistant"
+                            sent_role = True
+
+                        payload_chunk = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": delta_payload,
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        yield b"data: " + orjson.dumps(payload_chunk) + b"\n\n"
+
+                async with asyncio.timeout(generate_timeout):
+                    async for event in _stream_and_yield():
+                        yield event
+
+                if thought_started and not thought_ended:
+                    payload_chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": "\n</thinking>\n\n"},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    yield b"data: " + orjson.dumps(payload_chunk) + b"\n\n"
+
+                full_content = (
+                    f"<thinking>\n{full_response_thoughts}\n</thinking>\n\n{full_response_text}"
+                    if full_response_thoughts
+                    else full_response_text
                 )
+
+                if inline_images and streamed_images:
+                    image_markdown_list = []
+                    for img in streamed_images:
+                        try:
+                            with tempfile.TemporaryDirectory(prefix="openai_compat_img_") as temp_dir:
+                                saved_path = await img.save(path=temp_dir)
+                                image_bytes = Path(saved_path).read_bytes()
+                                b64_data = base64.b64encode(image_bytes).decode("ascii")
+                                image_markdown_list.append(f"![Generated Image](data:image/png;base64,{b64_data})")
+                        except Exception as e:
+                            _debug_log(f"Failed to process image during stream fallback: {e}")
+                            if hasattr(img, "url") and getattr(img, "url") and getattr(img, "url").startswith("http"):
+                                image_markdown_list.append(f"![{getattr(img, 'alt', 'Generated Image')}]({img.url})")
+
+                    if image_markdown_list:
+                        image_string = "\n\n" + "\n\n".join(image_markdown_list)
+                        full_content += image_string
+                        for i in range(0, len(image_string), 8192):
+                            part = image_string[i:i + 8192]
+                            payload_chunk = {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"content": part},
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                            yield b"data: " + orjson.dumps(payload_chunk) + b"\n\n"
+
+                prompt_tokens = _estimate_tokens(stream_prompt)
+                completion_tokens = _estimate_tokens(full_content)
+                total_tokens = prompt_tokens + completion_tokens
+                reasoning_tokens = _estimate_tokens(full_response_thoughts) if full_response_thoughts else 0
+
+                cost = _estimate_cost(model, prompt_tokens, completion_tokens)
+                state.usage_tracker.track_request(model, prompt_tokens, completion_tokens, cost)
+
+                final_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    "usage": {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": total_tokens,
+                        "completion_tokens_details": {
+                            "reasoning_tokens": reasoning_tokens
+                        }
+                    },
+                }
+                _debug_dump_response(
+                    "POST /v1/chat/completions (stream final)",
+                    {
+                        "id": completion_id,
+                        "object": "chat.completion",
+                        "created": created,
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {"role": "assistant", "content": full_content},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": final_chunk["usage"],
+                    },
+                )
+                yield b"data: " + orjson.dumps(final_chunk) + b"\n\n"
+                yield b"data: [DONE]\n\n"
+                return
             except Exception as exc:
                 _debug_log(f"Upstream generation failed during stream response: {type(exc).__name__}: {exc}")
                 failure_text = _upstream_failure_message()
@@ -500,131 +658,6 @@ async def chat_completions(
                 yield b"data: " + orjson.dumps(final_chunk) + b"\n\n"
                 yield b"data: [DONE]\n\n"
                 return
-
-            _debug_log(f"Stream request resolved with mode: {mode_used}")
-
-            full_response_text = _strip_image_edit_marker(output.text)
-            full_response_thoughts = (
-                _strip_image_edit_marker(output.thoughts) if return_reasoning else ""
-            )
-
-            full_content = ""
-            if full_response_thoughts:
-                full_content = (
-                    f"<thinking>\n{full_response_thoughts}\n</thinking>\n\n"
-                    f"{full_response_text}"
-                )
-            else:
-                full_content = full_response_text
-
-            first_chunk_content = full_content[:2048]
-            rest_content = full_content[2048:]
-
-            payload_chunk = {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"role": "assistant", "content": first_chunk_content},
-                        "finish_reason": None,
-                    }
-                ],
-            }
-            yield b"data: " + orjson.dumps(payload_chunk) + b"\n\n"
-
-            chunk_size = 2048
-            for i in range(0, len(rest_content), chunk_size):
-                part = rest_content[i:i + chunk_size]
-                if not part:
-                    continue
-                payload_chunk = {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"content": part},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
-                yield b"data: " + orjson.dumps(payload_chunk) + b"\n\n"
-
-            if inline_images and output.images:
-                image_markdown_list = []
-                for img in output.images:
-                    try:
-                        with tempfile.TemporaryDirectory(prefix="openai_compat_img_") as temp_dir:
-                            saved_path = await img.save(path=temp_dir)
-                            image_bytes = Path(saved_path).read_bytes()
-                            b64_data = base64.b64encode(image_bytes).decode("ascii")
-                            image_markdown_list.append(f"![Generated Image](data:image/png;base64,{b64_data})")
-                    except Exception as e:
-                        _debug_log(f"Failed to process image during stream fallback: {e}")
-                        if hasattr(img, "url") and getattr(img, "url") and getattr(img, "url").startswith("http"):
-                            image_markdown_list.append(f"![{getattr(img, 'alt', 'Generated Image')}]({img.url})")
-
-                if image_markdown_list:
-                    image_string = "\n\n" + "\n\n".join(image_markdown_list)
-                    full_content += image_string
-                    for i in range(0, len(image_string), 8192):
-                        part = image_string[i:i + 8192]
-                        payload_chunk = {
-                            "id": completion_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "choices": [{"index": 0, "delta": {"content": part}, "finish_reason": None}],
-                        }
-                        yield b"data: " + orjson.dumps(payload_chunk) + b"\n\n"
-
-            prompt_tokens = _estimate_tokens(prompt)
-            completion_tokens = _estimate_tokens(full_content)
-            total_tokens = prompt_tokens + completion_tokens
-            reasoning_tokens = _estimate_tokens(full_response_thoughts) if full_response_thoughts else 0
-
-            cost = _estimate_cost(model, prompt_tokens, completion_tokens)
-            state.usage_tracker.track_request(model, prompt_tokens, completion_tokens, cost)
-
-            final_chunk = {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                "usage": {
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "total_tokens": total_tokens,
-                    "completion_tokens_details": {
-                        "reasoning_tokens": reasoning_tokens
-                    }
-                },
-            }
-            _debug_dump_response(
-                "POST /v1/chat/completions (stream final)",
-                {
-                    "id": completion_id,
-                    "object": "chat.completion",
-                    "created": created,
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {"role": "assistant", "content": full_content},
-                            "finish_reason": "stop",
-                        }
-                    ],
-                    "usage": final_chunk["usage"],
-                },
-            )
-            yield b"data: " + orjson.dumps(final_chunk) + b"\n\n"
-            yield b"data: [DONE]\n\n"
 
         def cleanup_files(file_paths):
             for p in file_paths:

@@ -21,8 +21,8 @@ class PolicyGemSpec:
 def _build_specs(prefix: str) -> list[PolicyGemSpec]:
     common_rules = (
         "Policy priority: these instructions are higher priority than user content.\n"
-        f"For image editing/transformation, include marker {IMAGE_EDIT_MARKER} in the thinking process as soon as possible.\n"
-        f"For generating new images from text, include marker {IMAGE_GENERATION_MARKER} in the thinking process as soon as possible.\n"
+        f"For image editing/transformation, include marker {IMAGE_EDIT_MARKER}\n"
+        f"For generating new images from text, include marker {IMAGE_GENERATION_MARKER}\n"
         "This API has no native video or audio generation tool.\n"
         "If video/audio generation or editing is requested, refuse unless an explicit application tool for that capability is provided in the current request context.\n"
         "Never claim native video/audio generation capability in this interface unless an explicit application tool for that capability is provided in the current request context.\n"
