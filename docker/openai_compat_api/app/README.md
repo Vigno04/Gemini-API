@@ -2,22 +2,12 @@
 
 A FastAPI-based wrapper around Gemini WebAPI that provides OpenAI-compatible endpoints.
 
-## Architecture
-
-The codebase is organized into modular components for better maintainability:
-
-- **`main.py`** - Application initialization and FastAPI app setup
-- **`models.py`** - Pydantic models for API requests/responses
-- **`utils.py`** - Utility functions (auth, token estimation, etc.)
-- **`usage_tracker.py`** - Usage tracking and cost calculation
-- **`endpoints.py`** - All API endpoint implementations
-
 ## Features
 
 - ✅ OpenAI-compatible API endpoints
 - ✅ Streaming and non-streaming responses
-- ✅ Token usage tracking
-- ✅ Image generation support
+- ✅ Token usage tracking (calculated on the fly, gemini does not output that data)
+- ✅ Image generation and editing support (inline and not)
 - ✅ Content moderation
 - ✅ File upload/management
 - ✅ Comprehensive error handling

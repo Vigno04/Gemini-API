@@ -28,6 +28,8 @@ Notes:
 - `OPENAI_COMPAT_DEFAULT_MODEL` - Optional: Default model (default: gemini-3-flash)
 - `OPENAI_COMPAT_FORCE_STREAM` - Optional: Force SSE streaming for `/v1/chat/completions` and `/v1/completions` even if `stream=false` in requests (default: false)
 - `OPENAI_COMPAT_DEBUG` - Optional: Enable detailed request/response logging and set Gemini client to DEBUG log level (default: false)
+- `OPENAI_COMPAT_USE_ACCOUNT_LANGUAGE` - Optional: Use Gemini account language from session metadata (default: true). If false and `OPENAI_COMPAT_LANGUAGE` is empty, no fixed language is sent so the model can derive language from the conversation.
+- `OPENAI_COMPAT_LANGUAGE` - Optional: Explicit language override (e.g. `it`, `en`); highest precedence.
 - `OPENAI_COMPAT_USE_TEMPORARY_CHATS` - Optional: Use temporary chats (default: true)
 
 ## Quick start
