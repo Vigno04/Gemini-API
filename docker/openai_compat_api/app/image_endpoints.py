@@ -1,6 +1,7 @@
 import base64
 import asyncio
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -70,6 +71,60 @@ def _collect_output_images(output: Any) -> list[Any]:
 
     # Backward-compatible fallback for outputs without candidates.
     return list(getattr(output, "images", []) or [])
+
+
+def _build_image_edit_prompt(user_prompt: str | None) -> str:
+    base = (user_prompt or "Edit this image").strip() or "Edit this image"
+    return (
+        "Edit the attached image according to the request below. "
+        "You must return an edited image, not a text-only response.\n"
+        f"Request: {base}"
+    )
+
+
+def _debug_candidate_text_preview(output: Any, label: str) -> None:
+    candidates = list(getattr(output, "candidates", []) or [])
+    for idx, candidate in enumerate(candidates):
+        text = str(getattr(candidate, "text", "") or "")
+        preview = text[:120] + ("..." if len(text) > 120 else "")
+        _debug_log(
+            f"{label} candidate text: index={idx}, length={len(text)}, preview={preview!r}"
+        )
+
+
+def _extract_data_urls_from_output_text(output: Any) -> list[str]:
+    candidates = list(getattr(output, "candidates", []) or [])
+    if not candidates:
+        return []
+
+    data_url_pattern = re.compile(r"data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+")
+    results: list[str] = []
+    seen: set[str] = set()
+
+    for candidate in candidates:
+        text = str(getattr(candidate, "text", "") or "")
+        for match in data_url_pattern.findall(text):
+            if match not in seen:
+                seen.add(match)
+                results.append(match)
+
+    return results
+
+
+def _openai_item_from_data_url(
+    data_url: str,
+    response_format: str,
+    revised_prompt: str | None = None,
+) -> dict[str, str]:
+    if response_format == "url":
+        item: dict[str, str] = {"url": data_url}
+    else:
+        item = {"b64_json": _extract_b64_from_data_url(data_url)}
+
+    if revised_prompt is not None:
+        item["revised_prompt"] = revised_prompt
+
+    return item
 
 
 def _extract_b64_from_data_url(data_url: str) -> str:
@@ -527,8 +582,9 @@ async def edit_image(
         # Validate mask input for better client compatibility, even if not used by Gemini.
         await _read_image_payload(mask, "mask")
 
-    edit_prompt = prompt or "Edit this image"
+    edit_prompt = _build_image_edit_prompt(prompt)
     temp_image_path = _save_temp_image_file(image_bytes, image_ext)
+    all_images: list[Any] = []
 
     try:
         output = None
@@ -553,6 +609,8 @@ async def edit_image(
             )
 
         direct_images = _collect_output_images(output) if output is not None else []
+        if output is not None and not direct_images:
+            _debug_candidate_text_preview(output, "Image edit direct")
 
         if output is None or not direct_images:
             try:
@@ -573,6 +631,9 @@ async def edit_image(
                     timeout=generation_timeout,
                 )
                 _debug_log("Image edit chat fallback succeeded")
+                fallback_images = _collect_output_images(output)
+                if not fallback_images:
+                    _debug_candidate_text_preview(output, "Image edit chat fallback")
             except Exception as fallback_exc:
                 _debug_log(
                     f"Image edit chat fallback failed: {type(fallback_exc).__name__}: {fallback_exc}"
@@ -582,15 +643,58 @@ async def edit_image(
                         f"Image edit direct failure that triggered fallback: {type(direct_exc).__name__}: {direct_exc}"
                     )
                 raise HTTPException(status_code=502, detail=_upstream_failure_message()) from fallback_exc
+        all_images = _collect_output_images(output)
+
+        if not all_images:
+            _debug_log("Image edit produced no images; trying final forced-image retry")
+            forced_prompt = (
+                "Generate only one edited image for the attached file. "
+                "Do not return explanation text. "
+                f"Apply this edit: {(prompt or 'Edit this image').strip()}"
+            )
+            try:
+                output = await asyncio.wait_for(
+                    client.generate_content(
+                        prompt=forced_prompt,
+                        model=model,
+                        files=[temp_image_path],
+                        temporary=use_temporary_chats,
+                    ),
+                    timeout=generation_timeout,
+                )
+                all_images = _collect_output_images(output)
+                if not all_images:
+                    _debug_candidate_text_preview(output, "Image edit forced retry")
+            except Exception as force_exc:
+                _debug_log(
+                    f"Image edit forced-image retry failed: {type(force_exc).__name__}: {force_exc}"
+                )
     finally:
         try:
             temp_image_path.unlink(missing_ok=True)
         except Exception:
             pass
 
-    all_images = _collect_output_images(output)
-
     if not all_images:
+        data_urls = _extract_data_urls_from_output_text(output)
+        if data_urls:
+            _debug_log(f"Image edit fallback recovered inline data URLs: count={len(data_urls)}")
+            requested_count = max(1, min(n, len(data_urls)))
+            data_items = [
+                _openai_item_from_data_url(
+                    data_url,
+                    response_format=response_format,
+                    revised_prompt=prompt or "",
+                )
+                for data_url in data_urls[:requested_count]
+            ]
+            response_payload = {
+                "created": _unix_ts(),
+                "data": data_items,
+            }
+            _debug_dump_response("POST /v1/images/edits", response_payload)
+            return response_payload
+
         raise HTTPException(
             status_code=502,
             detail="No edited image was generated. Try rephrasing your prompt.",
@@ -713,6 +817,24 @@ async def create_image_variations(
     all_images = _collect_output_images(output)
 
     if not all_images:
+        data_urls = _extract_data_urls_from_output_text(output)
+        if data_urls:
+            _debug_log(f"Image variations fallback recovered inline data URLs: count={len(data_urls)}")
+            requested_count = max(1, min(n, len(data_urls)))
+            data_items = [
+                _openai_item_from_data_url(
+                    data_url,
+                    response_format=response_format,
+                )
+                for data_url in data_urls[:requested_count]
+            ]
+            response_payload = {
+                "created": _unix_ts(),
+                "data": data_items,
+            }
+            _debug_dump_response("POST /v1/images/variations", response_payload)
+            return response_payload
+
         raise HTTPException(
             status_code=502,
             detail="No image variations were generated.",
