@@ -1,4 +1,5 @@
 import base64
+import asyncio
 import os
 import tempfile
 from pathlib import Path
@@ -17,6 +18,24 @@ def _env_flag(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _generation_timeout_seconds() -> float:
+    raw = os.getenv("OPENAI_COMPAT_GENERATION_TIMEOUT_SECONDS", "120").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return 120.0
+    if value <= 0:
+        return 120.0
+    return value
+
+
+def _upstream_failure_message() -> str:
+    return (
+        "Upstream Gemini image generation was interrupted or returned an incomplete response. "
+        "Please retry the request."
+    )
 
 
 def _extract_b64_from_data_url(data_url: str) -> str:
@@ -459,6 +478,7 @@ async def edit_image(
 
     response_format = _validate_image_response_format(response_format)
     use_temporary_chats = _env_flag("OPENAI_COMPAT_USE_TEMPORARY_CHATS", True)
+    generation_timeout = _generation_timeout_seconds()
 
     _debug_log(
         f"Image edit request: prompt='{prompt[:50] if prompt else None}...', model={model}, "
@@ -475,12 +495,55 @@ async def edit_image(
     temp_image_path = _save_temp_image_file(image_bytes, image_ext)
 
     try:
-        output = await client.generate_content(
-            prompt=edit_prompt,
-            model=model,
-            files=[temp_image_path],
-            temporary=use_temporary_chats,
-        )
+        output = None
+        direct_exc: Exception | None = None
+
+        try:
+            output = await asyncio.wait_for(
+                client.generate_content(
+                    prompt=edit_prompt,
+                    model=model,
+                    files=[temp_image_path],
+                    temporary=use_temporary_chats,
+                ),
+                timeout=generation_timeout,
+            )
+            _debug_log("Image edit direct generation succeeded")
+        except Exception as exc:
+            direct_exc = exc
+            _debug_log(
+                f"Image edit direct generation failed: {type(exc).__name__}: {exc}. "
+                "Trying two-step chat fallback."
+            )
+
+        if output is None or not getattr(output, "images", None):
+            try:
+                chat = client.start_chat(model=model)
+                await asyncio.wait_for(
+                    chat.send_message(
+                        "Analyze this image for editing.",
+                        files=[temp_image_path],
+                        temporary=use_temporary_chats,
+                    ),
+                    timeout=generation_timeout,
+                )
+                output = await asyncio.wait_for(
+                    chat.send_message(
+                        edit_prompt,
+                        temporary=use_temporary_chats,
+                    ),
+                    timeout=generation_timeout,
+                )
+                _debug_log("Image edit chat fallback succeeded")
+            except Exception as fallback_exc:
+                _debug_log(
+                    f"Image edit chat fallback failed: {type(fallback_exc).__name__}: {fallback_exc}"
+                )
+                if direct_exc is not None:
+                    _debug_log(
+                        f"Image edit direct failure that triggered fallback: {type(direct_exc).__name__}: {direct_exc}"
+                    )
+                raise HTTPException(status_code=502, detail=_upstream_failure_message()) from fallback_exc
     finally:
         try:
             temp_image_path.unlink(missing_ok=True)
@@ -489,7 +552,7 @@ async def edit_image(
 
     if not output.images:
         raise HTTPException(
-            status_code=500,
+            status_code=502,
             detail="No edited image was generated. Try rephrasing your prompt.",
         )
 
@@ -580,6 +643,7 @@ async def create_image_variations(
 
     response_format = _validate_image_response_format(response_format)
     use_temporary_chats = _env_flag("OPENAI_COMPAT_USE_TEMPORARY_CHATS", True)
+    generation_timeout = _generation_timeout_seconds()
 
     _debug_log(
         f"Image variations request: model={model}, n={n}, response_format={response_format}"
@@ -591,11 +655,14 @@ async def create_image_variations(
     temp_image_path = _save_temp_image_file(image_bytes, image_ext)
 
     try:
-        output = await client.generate_content(
-            prompt=variation_prompt,
-            model=model,
-            files=[temp_image_path],
-            temporary=use_temporary_chats,
+        output = await asyncio.wait_for(
+            client.generate_content(
+                prompt=variation_prompt,
+                model=model,
+                files=[temp_image_path],
+                temporary=use_temporary_chats,
+            ),
+            timeout=generation_timeout,
         )
     finally:
         try:
@@ -605,7 +672,7 @@ async def create_image_variations(
 
     if not output.images:
         raise HTTPException(
-            status_code=500,
+            status_code=502,
             detail="No image variations were generated.",
         )
 
