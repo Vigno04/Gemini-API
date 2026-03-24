@@ -4,7 +4,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from fastapi import Form, Header, HTTPException, UploadFile
+from fastapi import File, Form, Header, HTTPException, UploadFile
 
 from app import app
 from models import ImageGenerationRequest
@@ -212,9 +212,9 @@ async def create_image(
 
 @app.post("/v1/images/edits")
 async def edit_image(
-    image: str | UploadFile = Form(...),
+    image: str | UploadFile = File(...),
     prompt: str | None = Form(None),
-    mask: str | UploadFile | None = Form(None),
+    mask: str | UploadFile | None = File(None),
     model: str = Form("gemini-3-flash"),
     n: int = Form(1),
     size: str = Form("1024x1024"),
@@ -334,7 +334,7 @@ async def edit_image(
 
 @app.post("/v1/images/variations")
 async def create_image_variations(
-    image: str | UploadFile = Form(...),
+    image: str | UploadFile = File(...),
     model: str = Form("gemini-3-flash"),
     n: int = Form(1),
     response_format: str = Form("url"),
