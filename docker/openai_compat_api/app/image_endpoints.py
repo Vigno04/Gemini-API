@@ -4,7 +4,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from fastapi import File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import Header, HTTPException, Request, UploadFile
 
 from app import app
 from models import ImageGenerationRequest
@@ -159,6 +159,78 @@ async def _read_image_payload(value: str | UploadFile, field_name: str) -> tuple
     return data, ext
 
 
+def _is_upload_file_like(value: Any) -> bool:
+    # Starlette and FastAPI upload objects both expose these attributes.
+    return (
+        value is not None
+        and hasattr(value, "read")
+        and hasattr(value, "seek")
+        and hasattr(value, "filename")
+    )
+
+
+def _summarize_payload_value(value: Any) -> Any:
+    if isinstance(value, str):
+        preview = value[:120]
+        if len(value) > 120:
+            preview += "..."
+        return {
+            "type": "str",
+            "length": len(value),
+            "starts_with": value[:24],
+            "preview": preview,
+        }
+
+    if _is_upload_file_like(value):
+        return {
+            "type": type(value).__name__,
+            "filename": getattr(value, "filename", None),
+            "content_type": getattr(value, "content_type", None),
+        }
+
+    if isinstance(value, list):
+        return {
+            "type": "list",
+            "length": len(value),
+            "items": [_summarize_payload_value(item) for item in value[:2]],
+        }
+
+    if isinstance(value, dict):
+        return {
+            "type": "dict",
+            "keys": sorted(list(value.keys())),
+        }
+
+    return {
+        "type": type(value).__name__ if value is not None else None,
+        "value": value,
+    }
+
+
+def _first_present(mapping: dict[str, Any], keys: list[str]) -> Any:
+    for key in keys:
+        if key in mapping and mapping.get(key) is not None:
+            return mapping.get(key)
+    return None
+
+
+def _normalize_media_field(value: Any) -> Any:
+    if isinstance(value, list):
+        return _normalize_media_field(value[0]) if value else None
+
+    if isinstance(value, dict):
+        if "url" in value:
+            return value.get("url")
+        if "b64_json" in value:
+            return value.get("b64_json")
+        nested = value.get("image_url")
+        if isinstance(nested, dict) and "url" in nested:
+            return nested.get("url")
+        return None
+
+    return value
+
+
 def _parse_int_field(raw_value: Any, field_name: str, default: int) -> int:
     if raw_value is None or raw_value == "":
         return default
@@ -180,15 +252,29 @@ async def _parse_image_request_body(request: Request) -> dict[str, Any]:
         if not isinstance(body, dict):
             raise HTTPException(status_code=400, detail="JSON body must be an object")
 
+        image_value = _first_present(
+            body,
+            ["image", "images", "image_url", "input_image", "file"],
+        )
+        mask_value = _first_present(body, ["mask", "mask_image"])
+
         return {
-            "image": body.get("image"),
+            "image": _normalize_media_field(image_value),
             "prompt": body.get("prompt"),
-            "mask": body.get("mask"),
+            "mask": _normalize_media_field(mask_value),
             "model": body.get("model") or "gemini-3-flash",
             "n": _parse_int_field(body.get("n"), "n", 1),
             "size": body.get("size") or "1024x1024",
             "response_format": body.get("response_format") or "url",
             "user": body.get("user"),
+            "_request_meta": {
+                "content_type": content_type,
+                "keys": sorted(list(body.keys())),
+                "field_summaries": {
+                    key: _summarize_payload_value(body.get(key))
+                    for key in sorted(list(body.keys()))
+                },
+            },
         }
 
     try:
@@ -196,15 +282,32 @@ async def _parse_image_request_body(request: Request) -> dict[str, Any]:
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Invalid form payload") from exc
 
+    image_value = (
+        form.get("image")
+        or form.get("images")
+        or form.get("image_url")
+        or form.get("input_image")
+        or form.get("file")
+    )
+    mask_value = form.get("mask") or form.get("mask_image")
+
     return {
-        "image": form.get("image"),
+        "image": _normalize_media_field(image_value),
         "prompt": form.get("prompt"),
-        "mask": form.get("mask"),
+        "mask": _normalize_media_field(mask_value),
         "model": form.get("model") or "gemini-3-flash",
         "n": _parse_int_field(form.get("n"), "n", 1),
         "size": form.get("size") or "1024x1024",
         "response_format": form.get("response_format") or "url",
         "user": form.get("user"),
+        "_request_meta": {
+            "content_type": content_type,
+            "keys": sorted(list(form.keys())),
+            "field_summaries": {
+                key: _summarize_payload_value(form.get(key))
+                for key in sorted(list(form.keys()))
+            },
+        },
     }
 
 
@@ -275,12 +378,28 @@ async def edit_image(
     size = str(parsed.get("size") or "1024x1024")
     response_format = str(parsed.get("response_format") or "url")
     user = parsed.get("user")
+    request_meta = parsed.get("_request_meta") or {}
+
+    _debug_dump_request(
+        "POST /v1/images/edits (parsed)",
+        {
+            "content_type": request_meta.get("content_type"),
+            "keys": request_meta.get("keys"),
+            "field_summaries": request_meta.get("field_summaries"),
+            "has_image": image is not None,
+            "image_type": type(image).__name__ if image is not None else None,
+            "image_summary": _summarize_payload_value(image),
+            "has_mask": mask is not None,
+            "mask_type": type(mask).__name__ if mask is not None else None,
+            "mask_summary": _summarize_payload_value(mask),
+        },
+    )
 
     if image is None:
         raise HTTPException(status_code=400, detail="Missing required field: image")
-    if not isinstance(image, (str, UploadFile)):
+    if not isinstance(image, str) and not _is_upload_file_like(image):
         raise HTTPException(status_code=400, detail="Invalid image field")
-    if mask is not None and not isinstance(mask, (str, UploadFile)):
+    if mask is not None and not isinstance(mask, str) and not _is_upload_file_like(mask):
         raise HTTPException(status_code=400, detail="Invalid mask field")
 
     image_debug: dict[str, Any]
@@ -405,10 +524,23 @@ async def create_image_variations(
     response_format = str(parsed.get("response_format") or "url")
     size = str(parsed.get("size") or "1024x1024")
     user = parsed.get("user")
+    request_meta = parsed.get("_request_meta") or {}
+
+    _debug_dump_request(
+        "POST /v1/images/variations (parsed)",
+        {
+            "content_type": request_meta.get("content_type"),
+            "keys": request_meta.get("keys"),
+            "field_summaries": request_meta.get("field_summaries"),
+            "has_image": image is not None,
+            "image_type": type(image).__name__ if image is not None else None,
+            "image_summary": _summarize_payload_value(image),
+        },
+    )
 
     if image is None:
         raise HTTPException(status_code=400, detail="Missing required field: image")
-    if not isinstance(image, (str, UploadFile)):
+    if not isinstance(image, str) and not _is_upload_file_like(image):
         raise HTTPException(status_code=400, detail="Invalid image field")
 
     image_debug: dict[str, Any]
