@@ -254,9 +254,9 @@ async def _parse_image_request_body(request: Request) -> dict[str, Any]:
 
         image_value = _first_present(
             body,
-            ["image", "images", "image_url", "input_image", "file"],
+            ["image", "image[]", "images", "image_url", "input_image", "file", "file[]"],
         )
-        mask_value = _first_present(body, ["mask", "mask_image"])
+        mask_value = _first_present(body, ["mask", "mask[]", "mask_image"])
 
         return {
             "image": _normalize_media_field(image_value),
@@ -284,12 +284,14 @@ async def _parse_image_request_body(request: Request) -> dict[str, Any]:
 
     image_value = (
         form.get("image")
+        or form.get("image[]")
         or form.get("images")
         or form.get("image_url")
         or form.get("input_image")
         or form.get("file")
+        or form.get("file[]")
     )
-    mask_value = form.get("mask") or form.get("mask_image")
+    mask_value = form.get("mask") or form.get("mask[]") or form.get("mask_image")
 
     return {
         "image": _normalize_media_field(image_value),
