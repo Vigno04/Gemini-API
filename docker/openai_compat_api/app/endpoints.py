@@ -46,6 +46,34 @@ state = AppState()
 IMAGE_EDIT_MARKER = "{OPENAI_COMPAT_IMAGE_EDIT}"
 IMAGE_GENERATION_MARKER = "{OPENAI_COMPAT_IMAGE_GENERATION}"
 
+
+def _account_status_payload(client: GeminiClient | None) -> dict[str, Any] | None:
+    if client is None:
+        return None
+
+    account_status = getattr(client, "account_status", None)
+    if account_status is None:
+        return None
+
+    payload: dict[str, Any] = {}
+
+    code = getattr(account_status, "value", None)
+    if code is not None:
+        payload["code"] = int(code)
+
+    name = getattr(account_status, "name", None)
+    if name:
+        payload["name"] = str(name)
+
+    description = getattr(account_status, "description", None)
+    if description:
+        payload["description"] = str(description)
+
+    if payload:
+        return payload
+
+    return {"raw": str(account_status)}
+
 BASE_ROUTING_SYSTEM_PROMPT = (
     "[OPENAI_COMPAT_ROUTING]\n"
     f"For image editing or transformation of an input image, include {IMAGE_EDIT_MARKER}.\n"
@@ -300,6 +328,7 @@ async def health_check() -> dict[str, Any]:
     response = {
         "status": "healthy" if state.client is not None else "unhealthy",
         "gemini_client": client_status,
+        "account_status": _account_status_payload(state.client),
         "timestamp": _unix_ts()
     }
     _debug_log(f"Health check: {response}")
@@ -312,12 +341,46 @@ async def health_check() -> dict[str, Any]:
 async def list_models(authorization: str | None = Header(default=None)) -> dict[str, Any]:
     _require_auth(authorization)
 
-    # Available Gemini models (as documented in README)
-    data = [
-        {"id": "gemini-3-flash", "object": "model", "created": 0, "owned_by": "gemini-webapi"},
-        {"id": "gemini-3-pro", "object": "model", "created": 0, "owned_by": "gemini-webapi"},
-        {"id": "gemini-3-flash-thinking", "object": "model", "created": 0, "owned_by": "gemini-webapi"},
-    ]
+    if state.client is None:
+        raise HTTPException(status_code=503, detail="Gemini client is not initialized")
+
+    discovered_models = state.client.list_models() or []
+    data: list[dict[str, Any]] = []
+
+    for model in discovered_models:
+        if getattr(model, "is_available", True) is False:
+            continue
+
+        model_id = getattr(model, "model_name", None) or getattr(model, "name", None)
+        if not model_id:
+            continue
+
+        model_item: dict[str, Any] = {
+            "id": str(model_id),
+            "object": "model",
+            "created": 0,
+            "owned_by": "gemini-webapi",
+        }
+
+        display_name = getattr(model, "display_name", None)
+        if display_name:
+            model_item["display_name"] = str(display_name)
+
+        description = getattr(model, "description", None)
+        if description:
+            model_item["description"] = str(description)
+
+        data.append(model_item)
+
+    # Keep backward-compatible defaults if dynamic discovery returns nothing.
+    if not data:
+        data = [
+            {"id": "gemini-3-flash", "object": "model", "created": 0, "owned_by": "gemini-webapi"},
+            {"id": "gemini-3-pro", "object": "model", "created": 0, "owned_by": "gemini-webapi"},
+            {"id": "gemini-3-flash-thinking", "object": "model", "created": 0, "owned_by": "gemini-webapi"},
+        ]
+
+    _debug_log(f"Models listed: count={len(data)}, account_status={_account_status_payload(state.client)}")
     return {"object": "list", "data": data}
 
 
@@ -1379,5 +1442,5 @@ async def get_usage(
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
+async def health() -> dict[str, Any]:
+    return await health_check()
