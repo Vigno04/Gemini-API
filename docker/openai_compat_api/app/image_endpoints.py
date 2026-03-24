@@ -4,7 +4,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from fastapi import File, Form, Header, HTTPException, UploadFile
+from fastapi import File, Form, Header, HTTPException, Request, UploadFile
 
 from app import app
 from models import ImageGenerationRequest
@@ -159,6 +159,55 @@ async def _read_image_payload(value: str | UploadFile, field_name: str) -> tuple
     return data, ext
 
 
+def _parse_int_field(raw_value: Any, field_name: str, default: int) -> int:
+    if raw_value is None or raw_value == "":
+        return default
+    try:
+        return int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid {field_name}") from exc
+
+
+async def _parse_image_request_body(request: Request) -> dict[str, Any]:
+    content_type = (request.headers.get("content-type") or "").lower()
+
+    if "application/json" in content_type:
+        try:
+            body = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="JSON body must be an object")
+
+        return {
+            "image": body.get("image"),
+            "prompt": body.get("prompt"),
+            "mask": body.get("mask"),
+            "model": body.get("model") or "gemini-3-flash",
+            "n": _parse_int_field(body.get("n"), "n", 1),
+            "size": body.get("size") or "1024x1024",
+            "response_format": body.get("response_format") or "url",
+            "user": body.get("user"),
+        }
+
+    try:
+        form = await request.form()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid form payload") from exc
+
+    return {
+        "image": form.get("image"),
+        "prompt": form.get("prompt"),
+        "mask": form.get("mask"),
+        "model": form.get("model") or "gemini-3-flash",
+        "n": _parse_int_field(form.get("n"), "n", 1),
+        "size": form.get("size") or "1024x1024",
+        "response_format": form.get("response_format") or "url",
+        "user": form.get("user"),
+    }
+
+
 @app.post("/v1/images/generations")
 async def create_image(
     payload: ImageGenerationRequest,
@@ -212,17 +261,27 @@ async def create_image(
 
 @app.post("/v1/images/edits")
 async def edit_image(
-    image: str | UploadFile = File(...),
-    prompt: str | None = Form(None),
-    mask: str | UploadFile | None = File(None),
-    model: str = Form("gemini-3-flash"),
-    n: int = Form(1),
-    size: str = Form("1024x1024"),
-    response_format: str = Form("url"),
-    user: str | None = Form(None),
+    request: Request,
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     _require_auth(authorization)
+
+    parsed = await _parse_image_request_body(request)
+    image = parsed.get("image")
+    prompt = parsed.get("prompt")
+    mask = parsed.get("mask")
+    model = str(parsed.get("model") or "gemini-3-flash")
+    n = _parse_int_field(parsed.get("n"), "n", 1)
+    size = str(parsed.get("size") or "1024x1024")
+    response_format = str(parsed.get("response_format") or "url")
+    user = parsed.get("user")
+
+    if image is None:
+        raise HTTPException(status_code=400, detail="Missing required field: image")
+    if not isinstance(image, (str, UploadFile)):
+        raise HTTPException(status_code=400, detail="Invalid image field")
+    if mask is not None and not isinstance(mask, (str, UploadFile)):
+        raise HTTPException(status_code=400, detail="Invalid mask field")
 
     image_debug: dict[str, Any]
     if not isinstance(image, str):
@@ -334,15 +393,23 @@ async def edit_image(
 
 @app.post("/v1/images/variations")
 async def create_image_variations(
-    image: str | UploadFile = File(...),
-    model: str = Form("gemini-3-flash"),
-    n: int = Form(1),
-    response_format: str = Form("url"),
-    size: str = Form("1024x1024"),
-    user: str | None = Form(None),
+    request: Request,
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     _require_auth(authorization)
+
+    parsed = await _parse_image_request_body(request)
+    image = parsed.get("image")
+    model = str(parsed.get("model") or "gemini-3-flash")
+    n = _parse_int_field(parsed.get("n"), "n", 1)
+    response_format = str(parsed.get("response_format") or "url")
+    size = str(parsed.get("size") or "1024x1024")
+    user = parsed.get("user")
+
+    if image is None:
+        raise HTTPException(status_code=400, detail="Missing required field: image")
+    if not isinstance(image, (str, UploadFile)):
+        raise HTTPException(status_code=400, detail="Invalid image field")
 
     image_debug: dict[str, Any]
     if not isinstance(image, str):
