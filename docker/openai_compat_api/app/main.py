@@ -7,6 +7,7 @@ from gemini_webapi import GeminiClient, set_log_level
 from state import state
 from app import app
 from policy_gems import sync_policy_gems
+from utils import _debug_log
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -78,6 +79,27 @@ async def _create_client() -> GeminiClient:
     else:
         state.policy_gem_ids = {}
         print("INFO: OPENAI_COMPAT_SYNC_POLICY_GEMS=false, skipping policy gem sync.")
+
+    # In debug mode, show all available gems plus policy routing targets.
+    try:
+        await client.fetch_gems(include_hidden=False)
+        all_gems = list(client.gems)
+        _debug_log(f"Available gems: count={len(all_gems)}")
+        for gem in all_gems:
+            _debug_log(
+                f"Gem available: id={getattr(gem, 'id', None)}, "
+                f"name={getattr(gem, 'name', None)!r}, predefined={getattr(gem, 'predefined', None)}"
+            )
+
+        if state.policy_gem_ids:
+            for key, gem_id in state.policy_gem_ids.items():
+                matched = next((g for g in all_gems if getattr(g, "id", None) == gem_id), None)
+                matched_name = getattr(matched, "name", None) if matched else None
+                _debug_log(
+                    f"Policy gem route: key={key}, gem_id={gem_id}, gem_name={matched_name!r}"
+                )
+    except Exception as exc:
+        _debug_log(f"Failed to fetch gems for startup debug logging: {type(exc).__name__}: {exc}")
 
     return client
 

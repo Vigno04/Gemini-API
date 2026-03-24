@@ -33,8 +33,9 @@ from state import state
 
 
 IMAGE_EDIT_MARKER = "{OPENAI_COMPAT_IMAGE_EDIT}"
-IMAGE_GENERATION_MARKER = "{OPENAI_COMPAT_IMAGE_GENERATION}"
-_COMPAT_MARKERS = (IMAGE_EDIT_MARKER, IMAGE_GENERATION_MARKER)
+_COMPAT_MARKERS = (
+    IMAGE_EDIT_MARKER,
+)
 
 
 def _account_status_payload(client: GeminiClient | None) -> dict[str, Any] | None:
@@ -81,6 +82,43 @@ def _selected_policy_gem_id(inline_images: bool) -> str | None:
     if gem_id:
         return gem_id
     return None
+
+
+def _resolve_gem_name(client: GeminiClient, gem_id: str | None) -> str | None:
+    if not gem_id:
+        return None
+
+    for gem in getattr(client, "gems", []):
+        if getattr(gem, "id", None) == gem_id:
+            return str(getattr(gem, "name", "")) or None
+    return None
+
+
+def _debug_log_gem_context(
+    client: GeminiClient,
+    *,
+    model: str,
+    stream_enabled: bool,
+    inline_images: bool,
+    selected_gem_id: str | None,
+) -> None:
+    policy_key = "inline_images" if inline_images else "no_inline_images"
+    selected_gem_name = _resolve_gem_name(client, selected_gem_id)
+
+    available_gems = list(getattr(client, "gems", []))
+    gem_labels = [
+        f"{getattr(g, 'id', None)}:{getattr(g, 'name', None)}"
+        for g in available_gems
+    ]
+
+    _debug_log(
+        "Chat gem routing: "
+        f"policy_key={policy_key}, selected_gem_id={selected_gem_id}, "
+        f"selected_gem_name={selected_gem_name!r}, model={model}, stream={stream_enabled}"
+    )
+    _debug_log(
+        f"Chat gem inventory: count={len(gem_labels)}, gems={gem_labels}"
+    )
 
 
 def _generation_timeout_seconds() -> float:
@@ -413,6 +451,13 @@ async def chat_completions(
     _debug_log(
         f"Chat completion request: model={model}, messages={len(payload.messages)}, "
         f"stream_requested={payload.stream}, stream_enabled={stream_enabled}, gem_selected={bool(gem_id)}"
+    )
+    _debug_log_gem_context(
+        client,
+        model=model,
+        stream_enabled=stream_enabled,
+        inline_images=inline_images,
+        selected_gem_id=gem_id,
     )
 
     if stream_enabled:

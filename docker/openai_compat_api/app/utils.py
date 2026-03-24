@@ -10,12 +10,12 @@ from gemini_webapi import GeminiClient
 
 def _debug_log(message: str, *args, **kwargs):
     """Log debug messages if OPENAI_COMPAT_DEBUG is enabled"""
-    if os.getenv("OPENAI_COMPAT_DEBUG", "false").lower() in ("true", "1", "yes"):
+    if os.getenv("OPENAI_COMPAT_DEBUG", "false").strip().lower() in ("true", "1", "yes", "on"):
         print(f"[DEBUG] {message}", *args, **kwargs)
 
 
 def _debug_enabled() -> bool:
-    return os.getenv("OPENAI_COMPAT_DEBUG", "false").lower() in ("true", "1", "yes")
+    return os.getenv("OPENAI_COMPAT_DEBUG", "false").strip().lower() in ("true", "1", "yes", "on")
 
 
 import re
