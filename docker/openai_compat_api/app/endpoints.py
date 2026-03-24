@@ -267,6 +267,21 @@ def _upstream_failure_message() -> str:
     )
 
 
+def _sse_response(event_generator: Any, background: BackgroundTask | None = None) -> StreamingResponse:
+    # Keep SSE frames unbuffered across common proxies and clients.
+    headers = {
+        "Cache-Control": "no-cache, no-transform",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(
+        event_generator,
+        media_type="text/event-stream",
+        headers=headers,
+        background=background,
+    )
+
+
 async def _read_image_payload(value: str | UploadFile, field_name: str) -> tuple[bytes, str]:
     if isinstance(value, str):
         raw = value.strip()
@@ -395,55 +410,59 @@ async def chat_completions(
 
         async def stream_events():
             try:
-                output = await asyncio.wait_for(
-                    client.generate_content(
-                        prompt=routed_prompt,
-                        model=model,
-                        files=files_for_generation,
-                        temporary=use_temporary_chats,
-                        gem=gem_id,
-                    ),
+                # Emit an initial SSE comment to open the stream immediately.
+                yield b": stream-start\n\n"
+
+                full_response_text = ""
+                full_response_thoughts = ""
+                thought_started = False
+                thought_ended = False
+                streamed_images = []
+                role_sent = False
+
+                async for chunk in client.generate_content_stream(
+                    prompt=routed_prompt,
+                    model=model,
+                    files=files_for_generation,
+                    temporary=use_temporary_chats,
+                    gem=gem_id,
                     timeout=generate_timeout,
-                )
-                _debug_log("Stream request resolved with direct generation mode")
+                ):
+                    if hasattr(chunk, "images") and chunk.images:
+                        streamed_images = chunk.images
 
-                full_response_text = _strip_image_edit_marker(output.text)
-                full_response_thoughts = (
-                    _strip_image_edit_marker(output.thoughts) if return_reasoning else ""
-                )
-
-                full_content = ""
-                if full_response_thoughts:
-                    full_content = (
-                        f"<thinking>\n{full_response_thoughts}\n</thinking>\n\n"
-                        f"{full_response_text}"
+                    delta = _strip_image_edit_marker(chunk.text_delta or "")
+                    thoughts_delta = (
+                        _strip_image_edit_marker(chunk.thoughts_delta) if return_reasoning else ""
                     )
-                else:
-                    full_content = full_response_text
 
-                first_chunk_content = full_content[:2048]
-                rest_content = full_content[2048:]
+                    if delta:
+                        full_response_text += delta
+                    if thoughts_delta:
+                        full_response_thoughts += thoughts_delta
 
-                payload_chunk = {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"role": "assistant", "content": first_chunk_content},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
-                yield b"data: " + orjson.dumps(payload_chunk) + b"\n\n"
+                    chunk_pieces: list[str] = []
+                    if thoughts_delta:
+                        if not thought_started:
+                            chunk_pieces.append("<thinking>\n")
+                            thought_started = True
+                        chunk_pieces.append(thoughts_delta)
 
-                chunk_size = 2048
-                for i in range(0, len(rest_content), chunk_size):
-                    part = rest_content[i:i + chunk_size]
-                    if not part:
+                    if delta:
+                        if thought_started and not thought_ended:
+                            chunk_pieces.append("\n</thinking>\n\n")
+                            thought_ended = True
+                        chunk_pieces.append(delta)
+
+                    content_to_send = "".join(chunk_pieces)
+                    if not content_to_send:
                         continue
+
+                    delta_payload: dict[str, Any] = {"content": content_to_send}
+                    if not role_sent:
+                        delta_payload["role"] = "assistant"
+                        role_sent = True
+
                     payload_chunk = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
@@ -452,16 +471,32 @@ async def chat_completions(
                         "choices": [
                             {
                                 "index": 0,
-                                "delta": {"content": part},
+                                "delta": delta_payload,
                                 "finish_reason": None,
                             }
                         ],
                     }
                     yield b"data: " + orjson.dumps(payload_chunk) + b"\n\n"
 
-                if inline_images and output.images:
+                if thought_started and not thought_ended:
+                    close_thinking_chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": "\n</thinking>\n\n"},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    yield b"data: " + orjson.dumps(close_thinking_chunk) + b"\n\n"
+
+                if inline_images and streamed_images:
                     image_markdown_list = []
-                    for img in output.images:
+                    for img in streamed_images:
                         try:
                             with tempfile.TemporaryDirectory(prefix="openai_compat_img_") as temp_dir:
                                 saved_path = await img.save(path=temp_dir)
@@ -475,7 +510,7 @@ async def chat_completions(
 
                     if image_markdown_list:
                         image_string = "\n\n" + "\n\n".join(image_markdown_list)
-                        full_content += image_string
+                        full_response_text += image_string
                         for i in range(0, len(image_string), 8192):
                             part = image_string[i:i + 8192]
                             payload_chunk = {
@@ -492,6 +527,15 @@ async def chat_completions(
                                 ],
                             }
                             yield b"data: " + orjson.dumps(payload_chunk) + b"\n\n"
+
+                full_content = ""
+                if full_response_thoughts:
+                    full_content = (
+                        f"<thinking>\n{full_response_thoughts}\n</thinking>\n\n"
+                        f"{full_response_text}"
+                    )
+                else:
+                    full_content = full_response_text
 
                 prompt_tokens = _estimate_tokens(prompt)
                 completion_tokens = _estimate_tokens(full_content)
@@ -579,10 +623,9 @@ async def chat_completions(
                 except Exception:
                     pass
 
-        return StreamingResponse(
-            stream_events(), 
-            media_type="text/event-stream",
-            background=BackgroundTask(cleanup_files, files) if files else None
+        return _sse_response(
+            stream_events(),
+            background=BackgroundTask(cleanup_files, files) if files else None,
         )
 
     try:
@@ -704,6 +747,9 @@ async def completions(
         created = _unix_ts()
 
         async def stream_events():
+            # Emit an initial SSE comment to open the stream immediately.
+            yield b": stream-start\n\n"
+
             full_response_text = ""  # Accumula il testo completo
             full_response_thoughts = ""  # Accumula i pensieri completi
             thought_started = False
@@ -835,7 +881,7 @@ async def completions(
             yield b"data: " + orjson.dumps(final_chunk) + b"\n\n"
             yield b"data: [DONE]\n\n"
 
-        return StreamingResponse(stream_events(), media_type="text/event-stream")
+        return _sse_response(stream_events())
 
     output = await client.generate_content(prompt=payload.prompt, model=model, temporary=use_temporary_chats)
 
