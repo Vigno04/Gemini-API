@@ -4,7 +4,7 @@ from fastapi import FastAPI
 
 from gemini_webapi import GeminiClient, set_log_level
 
-from endpoints import state
+from state import state
 from app import app
 from policy_gems import sync_policy_gems
 
