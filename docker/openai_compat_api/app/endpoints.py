@@ -43,6 +43,18 @@ class AppState:
 state = AppState()
 
 
+IMAGE_EDIT_MARKER = "{OPENAI_COMPAT_IMAGE_EDIT}"
+IMAGE_GENERATION_MARKER = "{OPENAI_COMPAT_IMAGE_GENERATION}"
+
+BASE_ROUTING_SYSTEM_PROMPT = (
+    "[OPENAI_COMPAT_ROUTING]\n"
+    f"For image editing or transformation of an input image, include {IMAGE_EDIT_MARKER}.\n"
+    f"For generating new images from text, include {IMAGE_GENERATION_MARKER}.\n"
+    "Do not include routing markers in user-visible output.\n"
+    "If video or audio generation is requested and no dedicated tool is provided, refuse."
+)
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -169,6 +181,92 @@ def _save_temp_image_file(image_bytes: bytes, extension: str) -> Path:
         return Path(tmp.name)
 
 
+def _contains_image_edit_marker(text: str | None, thoughts: str | None) -> bool:
+    source = f"{thoughts or ''}\n{text or ''}"
+    return IMAGE_EDIT_MARKER in source
+
+
+def _contains_image_generation_marker(text: str | None, thoughts: str | None) -> bool:
+    source = f"{thoughts or ''}\n{text or ''}"
+    return IMAGE_GENERATION_MARKER in source
+
+
+def _strip_image_edit_marker(value: str | None) -> str:
+    if not value:
+        return ""
+    cleaned = (
+        value.replace(IMAGE_EDIT_MARKER, "")
+        .replace(IMAGE_GENERATION_MARKER, "")
+    )
+    return cleaned.strip()
+
+
+def _with_routing_system_prompt(prompt: str, inline_images: bool) -> str:
+    if inline_images:
+        return (
+            f"system: {BASE_ROUTING_SYSTEM_PROMPT}\n"
+            f"{prompt}"
+        )
+
+    inline_policy = (
+        "Do not return inline images. If an image-generation tool is available, "
+        "call the tool; otherwise, refuse the image-generation request."
+    )
+    return (
+        f"system: {BASE_ROUTING_SYSTEM_PROMPT}\n"
+        f"system: {inline_policy}\n"
+        f"{prompt}"
+    )
+
+
+async def _generate_with_image_edit_routing(
+    client: GeminiClient,
+    prompt: str,
+    model: str,
+    files: list[Any],
+    use_temporary_chats: bool,
+    inline_images: bool,
+) -> tuple[Any, str]:
+    """Use marker-based routing: single-turn by default, two-turn chat for image-edit intent (with or without fresh files)."""
+
+    routed_prompt = _with_routing_system_prompt(prompt, inline_images=inline_images)
+
+    output = await client.generate_content(
+        prompt=routed_prompt,
+        model=model,
+        files=files if files else None,
+        temporary=use_temporary_chats,
+    )
+
+    if not _contains_image_edit_marker(output.text, output.thoughts):
+        if _contains_image_generation_marker(output.text, output.thoughts):
+            _debug_log("Image generation marker detected for request.")
+        return output, "single_turn"
+
+    _debug_log(
+        "Image edit marker detected. Retrying prompt with two-turn chat flow."
+    )
+
+    chat = client.start_chat(model=model)
+    if files:
+        await chat.send_message(
+            "Analyze the attached image and keep it in context for the next instruction.",
+            files=files,
+            temporary=use_temporary_chats,
+        )
+    else:
+        await chat.send_message(
+            "Review prior conversation context, including any previously referenced image context, and keep it in context for the next instruction.",
+            temporary=use_temporary_chats,
+        )
+
+    fallback = await chat.send_message(
+        prompt,
+        temporary=use_temporary_chats,
+    )
+    return fallback, "two_turn_chat"
+
+
 async def _read_image_payload(value: str | UploadFile, field_name: str) -> tuple[bytes, str]:
     if isinstance(value, str):
         raw = value.strip()
@@ -227,7 +325,7 @@ async def list_models(authorization: str | None = Header(default=None)) -> dict[
 async def chat_completions(
     payload: ChatCompletionRequest,
     authorization: str | None = Header(default=None),
-) -> dict[str, Any]:
+) -> Any:
     _require_auth(authorization)
     _debug_dump_request("POST /v1/chat/completions", payload)
 
@@ -238,7 +336,7 @@ async def chat_completions(
     model = payload.model or os.getenv("OPENAI_COMPAT_DEFAULT_MODEL", "gemini-3-flash")
     prompt, files = _messages_to_prompt(payload.messages)
     
-    if getattr(payload, "response_format", None) and payload.response_format.get("type") == "json_object":
+    if isinstance(payload.response_format, dict) and payload.response_format.get("type") == "json_object":
         prompt += "\n\n(IMPORTANT: Please respond with a valid JSON object.)"
 
     use_temporary_chats = os.getenv("OPENAI_COMPAT_USE_TEMPORARY_CHATS", "true").lower() == "true"
@@ -257,68 +355,53 @@ async def chat_completions(
         created = _unix_ts()
 
         async def stream_events():
-            full_response_text = ""  # Accumula il testo completo
-            full_response_thoughts = ""  # Accumula i pensieri completi
-            thought_started = False
-            thought_ended = False
-            is_first_chunk = True
-            streamed_images = []
-
-            async for chunk in client.generate_content_stream(
+            output, mode_used = await _generate_with_image_edit_routing(
+                client=client,
                 prompt=prompt,
                 model=model,
-                files=files if files else None,
-                temporary=use_temporary_chats,
-            ):
-                if hasattr(chunk, "images") and chunk.images:
-                    streamed_images = chunk.images
-                
-                delta = chunk.text_delta or ""
-                thoughts_delta = chunk.thoughts_delta if return_reasoning else ""
-                if not thoughts_delta:
-                    thoughts_delta = ""
+                files=files,
+                use_temporary_chats=use_temporary_chats,
+                inline_images=inline_images,
+            )
+            _debug_log(f"Stream request resolved with mode: {mode_used}")
 
-                content_to_send = ""
+            full_response_text = _strip_image_edit_marker(output.text)
+            full_response_thoughts = (
+                _strip_image_edit_marker(output.thoughts) if return_reasoning else ""
+            )
 
-                if thoughts_delta:
-                    if not thought_started:
-                        content_to_send += "<thinking>\n"
-                        thought_started = True
-                    content_to_send += thoughts_delta
+            full_content = ""
+            if full_response_thoughts:
+                full_content = (
+                    f"<thinking>\n{full_response_thoughts}\n</thinking>\n\n"
+                    f"{full_response_text}"
+                )
+            else:
+                full_content = full_response_text
 
-                if delta:
-                    if thought_started and not thought_ended:
-                        content_to_send += "\n</thinking>\n\n"
-                        thought_ended = True
-                    content_to_send += delta
+            first_chunk_content = full_content[:2048]
+            rest_content = full_content[2048:]
 
-                if delta:
-                    full_response_text += delta  # Accumula testo
-                if thoughts_delta:
-                    full_response_thoughts += thoughts_delta  # Accumula pensieri
-
-                if content_to_send or is_first_chunk:
-                    delta_dict = {"content": content_to_send}
-                    if is_first_chunk:
-                        delta_dict["role"] = "assistant"
-                        is_first_chunk = False
-
-                    payload_chunk = {
-                        "id": completion_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": delta_dict,
-                                "finish_reason": None,
-                            }
-                        ],
+            payload_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": first_chunk_content},
+                        "finish_reason": None,
                     }
-                    yield b"data: " + orjson.dumps(payload_chunk) + b"\n\n"
+                ],
+            }
+            yield b"data: " + orjson.dumps(payload_chunk) + b"\n\n"
 
-            if thought_started and not thought_ended:
+            chunk_size = 2048
+            for i in range(0, len(rest_content), chunk_size):
+                part = rest_content[i:i + chunk_size]
+                if not part:
+                    continue
                 payload_chunk = {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
@@ -327,23 +410,16 @@ async def chat_completions(
                     "choices": [
                         {
                             "index": 0,
-                            "delta": {"content": "\n</thinking>\n\n"},
+                            "delta": {"content": part},
                             "finish_reason": None,
                         }
                     ],
                 }
                 yield b"data: " + orjson.dumps(payload_chunk) + b"\n\n"
 
-            # Combina pensieri e testo per il contenuto finale
-            full_content = ""
-            if full_response_thoughts:
-                full_content = f"<thinking>\n{full_response_thoughts}\n</thinking>\n\n{full_response_text}"
-            else:
-                full_content = full_response_text
-
-            if inline_images and streamed_images:
+            if inline_images and output.images:
                 image_markdown_list = []
-                for img in streamed_images:
+                for img in output.images:
                     try:
                         with tempfile.TemporaryDirectory(prefix="openai_compat_img_") as temp_dir:
                             saved_path = await img.save(path=temp_dir)
@@ -351,19 +427,15 @@ async def chat_completions(
                             b64_data = base64.b64encode(image_bytes).decode("ascii")
                             image_markdown_list.append(f"![Generated Image](data:image/png;base64,{b64_data})")
                     except Exception as e:
-                        _debug_log(f"Failed to process image during stream: {e}")
+                        _debug_log(f"Failed to process image during stream fallback: {e}")
                         if hasattr(img, "url") and getattr(img, "url") and getattr(img, "url").startswith("http"):
                             image_markdown_list.append(f"![{getattr(img, 'alt', 'Generated Image')}]({img.url})")
-                
+
                 if image_markdown_list:
                     image_string = "\n\n" + "\n\n".join(image_markdown_list)
-                    full_response_text += image_string
                     full_content += image_string
-                    
-                    # Split the large base64 string into smaller chunks for SSE delivery
-                    chunk_size = 8192
-                    for i in range(0, len(image_string), chunk_size):
-                        part = image_string[i:i+chunk_size]
+                    for i in range(0, len(image_string), 8192):
+                        part = image_string[i:i + 8192]
                         payload_chunk = {
                             "id": completion_id,
                             "object": "chat.completion.chunk",
@@ -373,13 +445,11 @@ async def chat_completions(
                         }
                         yield b"data: " + orjson.dumps(payload_chunk) + b"\n\n"
 
-            # Chunk finale con token calcolati
             prompt_tokens = _estimate_tokens(prompt)
             completion_tokens = _estimate_tokens(full_content)
             total_tokens = prompt_tokens + completion_tokens
             reasoning_tokens = _estimate_tokens(full_response_thoughts) if full_response_thoughts else 0
 
-            # Track usage
             cost = _estimate_cost(model, prompt_tokens, completion_tokens)
             state.usage_tracker.track_request(model, prompt_tokens, completion_tokens, cost)
 
@@ -432,12 +502,15 @@ async def chat_completions(
         )
 
     try:
-        output = await client.generate_content(
+        output, mode_used = await _generate_with_image_edit_routing(
+            client=client,
             prompt=prompt,
             model=model,
-            files=files if files else None,
-            temporary=use_temporary_chats
+            files=files,
+            use_temporary_chats=use_temporary_chats,
+            inline_images=inline_images,
         )
+        _debug_log(f"Non-stream file request resolved with mode: {mode_used}")
     finally:
         for fpath in files:
             try:
@@ -449,8 +522,8 @@ async def chat_completions(
     created = _unix_ts()
 
     # Combine thoughts and text for thinking models
-    thoughts = output.thoughts if return_reasoning else ""
-    text = output.text
+    thoughts = _strip_image_edit_marker(output.thoughts) if return_reasoning else ""
+    text = _strip_image_edit_marker(output.text)
     full_content = ""
 
     if thoughts:
@@ -517,7 +590,7 @@ async def chat_completions(
 async def completions(
     payload: CompletionRequest,
     authorization: str | None = Header(default=None),
-) -> dict[str, Any]:
+) -> Any:
     _require_auth(authorization)
     _debug_dump_request("POST /v1/completions", payload)
 
